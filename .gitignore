@@ -215,3 +215,4 @@ start-local.sh
 dev-setup.sh
 data/
 .ace-tool/
+openspec/
