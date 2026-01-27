@@ -3,11 +3,11 @@ package proxy
 import (
 	"bufio"
 	"encoding/json"
-	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 
 	"gpt-load/internal/utils"
 
@@ -16,11 +16,11 @@ import (
 )
 
 type toolcallCompatTransformer struct {
-	triggerSignal string
+	idSeed string
 }
 
-func newToolcallCompatTransformer(triggerSignal string) *toolcallCompatTransformer {
-	return &toolcallCompatTransformer{triggerSignal: triggerSignal}
+func newToolcallCompatTransformer(idSeed string) *toolcallCompatTransformer {
+	return &toolcallCompatTransformer{idSeed: idSeed}
 }
 
 func (t *toolcallCompatTransformer) HandleUpstreamError(c *gin.Context, statusCode int, upstreamBody []byte) bool {
@@ -43,8 +43,8 @@ func (t *toolcallCompatTransformer) HandleSuccess(c *gin.Context, resp *http.Res
 	}
 
 	out := decompressed
-	if !isStream && t.triggerSignal != "" {
-		if converted, ok := restoreToolCallsInChatCompletion(decompressed, t.triggerSignal); ok {
+	if !isStream {
+		if converted, ok := restoreToolCallsInChatCompletion(decompressed, t.idSeed); ok {
 			out = converted
 		}
 	}
@@ -117,30 +117,43 @@ func (t *toolcallCompatTransformer) streamOpenAIWithToolcallCompat(c *gin.Contex
 		return fmt.Errorf("streaming unsupported by writer")
 	}
 
-	return transformOpenAIStreamToolcallCompat(resp.Body, openAISSEEmitter{w: c.Writer, flush: flusher.Flush}, t.triggerSignal)
+	return transformOpenAIStreamToolcallCompat(resp.Body, openAISSEEmitter{w: c.Writer, flush: flusher.Flush}, t.idSeed)
 }
 
-func transformOpenAIStreamToolcallCompat(r io.Reader, emitter openAISSEEmitter, triggerSignal string) error {
+func transformOpenAIStreamToolcallCompat(r io.Reader, emitter openAISSEEmitter, idSeed string) error {
 	reader := bufio.NewReader(r)
 	var dataLines []string
 
 	envelope := openAIStreamEnvelope{}
 
-	pendingText := ""
 	protocolBuffer := ""
 	triggered := false
-	roleEmitted := false
-	pendingRole := ""
+	sawRole := false
+	detector := newToolcallCompatStreamDetector()
 
-	flushContent := func(text string) error {
+	writeLine := func(line string) error {
+		if _, err := io.WriteString(emitter.w, line); err != nil {
+			return err
+		}
+		if emitter.flush != nil {
+			emitter.flush()
+		}
+		return nil
+	}
+
+	emitRawPayload := func(payload string) error {
+		return writeLine("data: " + payload + "\n\n")
+	}
+
+	flushDetectorRemainder := func() error {
+		text := detector.FlushRemainder()
 		if text == "" {
 			return nil
 		}
 		delta := map[string]any{"content": text}
-		if !roleEmitted && strings.TrimSpace(pendingRole) != "" {
-			delta["role"] = pendingRole
-			roleEmitted = true
-			pendingRole = ""
+		if !sawRole {
+			delta["role"] = "assistant"
+			sawRole = true
 		}
 		return emitter.emit(envelope.withChoice(map[string]any{
 			"index":         0,
@@ -149,38 +162,12 @@ func transformOpenAIStreamToolcallCompat(r io.Reader, emitter openAISSEEmitter, 
 		}))
 	}
 
-	emitRoleOnly := func(role string) error {
-		if roleEmitted || strings.TrimSpace(role) == "" {
-			return nil
-		}
-		roleEmitted = true
-		pendingRole = ""
-		return emitter.emit(envelope.withChoice(map[string]any{
-			"index":         0,
-			"delta":         map[string]any{"role": role},
-			"finish_reason": nil,
-		}))
-	}
-
-	emitFinish := func(reason string) error {
-		if err := flushContent(pendingText); err != nil {
-			return err
-		}
-		pendingText = ""
-		return emitter.emit(envelope.withChoice(map[string]any{
-			"index":         0,
-			"delta":         map[string]any{},
-			"finish_reason": reason,
-		}))
-	}
-
 	emitToolCallsAndFinish := func(calls []toolcallCompatFunctionCall) error {
-		if err := flushContent(pendingText); err != nil {
+		if err := flushDetectorRemainder(); err != nil {
 			return err
 		}
-		pendingText = ""
 
-		seed := toolcallCompatIDSeed(triggerSignal)
+		seed := toolcallCompatIDSeed(idSeed)
 		deltaCalls := make([]any, 0, len(calls))
 		for i, call := range calls {
 			deltaCalls = append(deltaCalls, map[string]any{
@@ -194,11 +181,17 @@ func transformOpenAIStreamToolcallCompat(r io.Reader, emitter openAISSEEmitter, 
 			})
 		}
 
+		delta := map[string]any{
+			"tool_calls": deltaCalls,
+		}
+		if !sawRole {
+			delta["role"] = "assistant"
+			sawRole = true
+		}
+
 		if err := emitter.emit(envelope.withChoice(map[string]any{
-			"index": 0,
-			"delta": map[string]any{
-				"tool_calls": deltaCalls,
-			},
+			"index":         0,
+			"delta":         delta,
 			"finish_reason": nil,
 		})); err != nil {
 			return err
@@ -216,22 +209,45 @@ func transformOpenAIStreamToolcallCompat(r io.Reader, emitter openAISSEEmitter, 
 	}
 
 	emitStopAndDone := func() error {
-		if err := emitFinish("stop"); err != nil {
+		if err := flushDetectorRemainder(); err != nil {
+			return err
+		}
+		if err := emitter.emit(envelope.withChoice(map[string]any{
+			"index":         0,
+			"delta":         map[string]any{},
+			"finish_reason": "stop",
+		})); err != nil {
 			return err
 		}
 		return emitter.done()
 	}
 
-	maybeFinalizeFromProtocol := func() (bool, error) {
-		if !strings.Contains(protocolBuffer, "</function_calls>") {
-			return false, nil
-		}
-		_, calls, ok := extractToolcallCompatFunctionCalls(protocolBuffer, triggerSignal)
+	finalizeFromProtocol := func() error {
+		calls, ok := parseToolcallCompatFunctionCalls(protocolBuffer)
 		if !ok {
-			logrus.WithField("trigger", triggerSignal).Warn("toolcall compat: failed to parse tool calls from stream")
-			return true, emitStopAndDone()
+			logrus.WithField("seed", seedForLog(idSeed)).Debug("toolcall compat: stream protocol parse failed")
+			logrus.WithField("seed", seedForLog(idSeed)).Warn("toolcall compat: failed to parse tool calls from stream")
+			return emitStopAndDone()
 		}
-		return true, emitToolCallsAndFinish(calls)
+		tools := make([]string, 0, len(calls))
+		seen := make(map[string]struct{}, len(calls))
+		for _, call := range calls {
+			name := strings.TrimSpace(call.ToolName)
+			if name == "" {
+				continue
+			}
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			tools = append(tools, name)
+		}
+		logrus.WithFields(logrus.Fields{
+			"seed":       seedForLog(idSeed),
+			"tool_count": len(calls),
+			"tools":      tools,
+		}).Debug("toolcall compat: stream protocol parsed")
+		return emitToolCallsAndFinish(calls)
 	}
 
 	const maxProtocolBufferBytes = 512 * 1024
@@ -257,18 +273,21 @@ func transformOpenAIStreamToolcallCompat(r io.Reader, emitter openAISSEEmitter, 
 			}
 			if payload == "[DONE]" {
 				if triggered {
-					logrus.WithField("trigger", triggerSignal).Warn("toolcall compat: stream ended before parsing tool calls")
-					return emitStopAndDone()
+					return finalizeFromProtocol()
 				}
-				if err := flushContent(pendingText); err != nil {
+				if err := flushDetectorRemainder(); err != nil {
 					return err
 				}
-				pendingText = ""
 				return emitter.done()
 			}
 
 			var chunk map[string]any
 			if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+				if !triggered {
+					if err := emitRawPayload(payload); err != nil {
+						return err
+					}
+				}
 				continue
 			}
 
@@ -287,90 +306,151 @@ func transformOpenAIStreamToolcallCompat(r io.Reader, emitter openAISSEEmitter, 
 
 			choices, _ := chunk["choices"].([]any)
 			if len(choices) == 0 {
+				if !triggered {
+					if err := emitRawPayload(payload); err != nil {
+						return err
+					}
+				}
 				continue
 			}
 			choice, _ := choices[0].(map[string]any)
 			if choice == nil {
-				continue
-			}
-
-			if fr, ok := choice["finish_reason"].(string); ok && strings.TrimSpace(fr) != "" && !triggered {
-				if err := emitFinish(fr); err != nil {
-					return err
+				if !triggered {
+					if err := emitRawPayload(payload); err != nil {
+						return err
+					}
 				}
 				continue
 			}
 
 			delta, _ := choice["delta"].(map[string]any)
 			if delta == nil {
+				if !triggered {
+					if err := emitRawPayload(payload); err != nil {
+						return err
+					}
+				}
 				continue
 			}
 
 			if role, ok := delta["role"].(string); ok && strings.TrimSpace(role) != "" {
-				if !roleEmitted && pendingRole == "" {
-					pendingRole = role
-				}
-				if err := emitRoleOnly(role); err != nil {
-					return err
-				}
+				sawRole = true
 			}
+
+			finishReason, _ := choice["finish_reason"].(string)
+			finishReason = strings.TrimSpace(finishReason)
 
 			content, _ := delta["content"].(string)
-			if content == "" {
-				continue
-			}
-
 			if !triggered {
-				pendingText += content
-				if idx := strings.Index(pendingText, triggerSignal); idx != -1 {
-					plain := pendingText[:idx]
-					protocolBuffer = pendingText[idx:]
-					pendingText = ""
-					triggered = true
-					if err := flushContent(plain); err != nil {
-						return err
+				if content != "" {
+					detected, emitText := detector.Process(content)
+					needsRewrite := emitText != content
+
+					if detected {
+						triggered = true
+						protocolBuffer = detector.TakeRemainder()
+						choice["finish_reason"] = nil
+						needsRewrite = true
+						logrus.WithField("seed", seedForLog(idSeed)).Debug("toolcall compat: stream protocol triggered")
 					}
-					if done, err := maybeFinalizeFromProtocol(); done {
-						return err
+
+					if emitText == "" {
+						delete(delta, "content")
+					} else {
+						delta["content"] = emitText
+					}
+
+					if !triggered && finishReason != "" {
+						choice["finish_reason"] = nil
+						out, err := json.Marshal(chunk)
+						if err != nil {
+							return err
+						}
+						if err := emitRawPayload(string(out)); err != nil {
+							return err
+						}
+						if err := flushDetectorRemainder(); err != nil {
+							return err
+						}
+						if err := emitter.emit(envelope.withChoice(map[string]any{
+							"index":         0,
+							"delta":         map[string]any{},
+							"finish_reason": finishReason,
+						})); err != nil {
+							return err
+						}
+						continue
+					}
+
+					if needsRewrite {
+						out, err := json.Marshal(chunk)
+						if err != nil {
+							return err
+						}
+						if err := emitRawPayload(string(out)); err != nil {
+							return err
+						}
+					} else {
+						if err := emitRawPayload(payload); err != nil {
+							return err
+						}
+					}
+
+					if triggered {
+						if len(protocolBuffer) > maxProtocolBufferBytes {
+							logrus.WithField("seed", seedForLog(idSeed)).Warn("toolcall compat: stream protocol buffer exceeded limit")
+							return emitStopAndDone()
+						}
+						if strings.Contains(protocolBuffer, "</function_calls>") {
+							return finalizeFromProtocol()
+						}
 					}
 					continue
 				}
 
-				if len(pendingText) > len(triggerSignal) {
-					flushLen := len(pendingText) - len(triggerSignal)
-					if flushLen > 0 {
-						toFlush := pendingText[:flushLen]
-						pendingText = pendingText[flushLen:]
-						if err := flushContent(toFlush); err != nil {
-							return err
-						}
+				if finishReason != "" {
+					if err := flushDetectorRemainder(); err != nil {
+						return err
 					}
+				}
+				if err := emitRawPayload(payload); err != nil {
+					return err
 				}
 				continue
 			}
 
-			protocolBuffer += content
+			if content != "" {
+				protocolBuffer += content
+			}
 			if len(protocolBuffer) > maxProtocolBufferBytes {
-				logrus.WithField("trigger", triggerSignal).Warn("toolcall compat: stream protocol buffer exceeded limit")
+				logrus.WithField("seed", seedForLog(idSeed)).Warn("toolcall compat: stream protocol buffer exceeded limit")
 				return emitStopAndDone()
 			}
-			if done, err := maybeFinalizeFromProtocol(); done {
-				return err
+			if strings.Contains(protocolBuffer, "</function_calls>") {
+				return finalizeFromProtocol()
 			}
-
+			if finishReason != "" {
+				return finalizeFromProtocol()
+			}
 			continue
 		}
 
 		if strings.HasPrefix(line, "data:") {
 			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+			continue
+		}
+
+		if !triggered {
+			if err := writeLine(line + "\n"); err != nil {
+				return err
+			}
 		}
 	}
 
 	if triggered {
-		logrus.WithField("trigger", triggerSignal).Warn("toolcall compat: stream ended unexpectedly")
-		return emitStopAndDone()
+		return finalizeFromProtocol()
 	}
-	if err := flushContent(pendingText); err != nil {
+	if err := flushDetectorRemainder(); err != nil {
 		return err
 	}
 	return emitter.done()
@@ -391,15 +471,16 @@ func writeOpenAIDone(w io.Writer) error {
 }
 
 type toolcallCompatFunctionCalls struct {
-	Calls []toolcallCompatFunctionCall `xml:"function_call"`
+	Calls []toolcallCompatFunctionCallXML `xml:"function_call"`
 }
 
-type toolcallCompatFunctionCall struct {
+type toolcallCompatFunctionCallXML struct {
 	ToolName string `xml:"tool"`
 	ArgsJSON string `xml:"args_json"`
+	Raw      string `xml:",chardata"`
 }
 
-func restoreToolCallsInChatCompletion(body []byte, triggerSignal string) ([]byte, bool) {
+func restoreToolCallsInChatCompletion(body []byte, idSeed string) ([]byte, bool) {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return body, false
@@ -420,12 +501,12 @@ func restoreToolCallsInChatCompletion(body []byte, triggerSignal string) ([]byte
 	}
 	content, _ := msg["content"].(string)
 
-	plain, calls, ok := extractToolcallCompatFunctionCalls(content, triggerSignal)
+	plain, calls, ok := extractToolcallCompatFunctionCalls(content)
 	if !ok || len(calls) == 0 {
 		return body, false
 	}
 
-	seed := toolcallCompatIDSeed(triggerSignal)
+	seed := toolcallCompatIDSeed(idSeed)
 	toolCalls := make([]any, 0, len(calls))
 	for i, call := range calls {
 		toolCalls = append(toolCalls, map[string]any{
@@ -438,7 +519,11 @@ func restoreToolCallsInChatCompletion(body []byte, triggerSignal string) ([]byte
 		})
 	}
 
-	msg["content"] = plain
+	if strings.TrimSpace(plain) == "" {
+		msg["content"] = nil
+	} else {
+		msg["content"] = plain
+	}
 	msg["tool_calls"] = toolCalls
 	choice0["finish_reason"] = "tool_calls"
 	choices[0] = choice0
@@ -451,57 +536,352 @@ func restoreToolCallsInChatCompletion(body []byte, triggerSignal string) ([]byte
 	return converted, true
 }
 
-func extractToolcallCompatFunctionCalls(content string, triggerSignal string) (string, []toolcallCompatFunctionCall, bool) {
-	idx := strings.Index(content, triggerSignal)
-	if idx == -1 {
-		return content, nil, false
-	}
-
-	plain := strings.TrimRight(content[:idx], "\n")
-	rest := content[idx+len(triggerSignal):]
-
-	start := strings.Index(rest, "<function_calls>")
-	end := strings.Index(rest, "</function_calls>")
-	if start == -1 || end == -1 || end < start {
-		return content, nil, false
-	}
-
-	xmlBlob := rest[start : end+len("</function_calls>")]
-	var parsed toolcallCompatFunctionCalls
-	if err := xml.Unmarshal([]byte(xmlBlob), &parsed); err != nil {
-		return content, nil, false
-	}
-
-	out := make([]toolcallCompatFunctionCall, 0, len(parsed.Calls))
-	for _, call := range parsed.Calls {
-		name := strings.TrimSpace(call.ToolName)
-		if name == "" {
-			continue
-		}
-		out = append(out, toolcallCompatFunctionCall{
-			ToolName: name,
-			ArgsJSON: call.ArgsJSON,
-		})
-	}
-
-	if len(out) == 0 {
-		return content, nil, false
-	}
-	return plain, out, true
+type toolcallCompatFunctionCall struct {
+	ToolName string
+	ArgsJSON string
 }
 
-func toolcallCompatIDSeed(triggerSignal string) string {
-	signal := strings.TrimSpace(triggerSignal)
+func extractToolcallCompatFunctionCalls(content string) (string, []toolcallCompatFunctionCall, bool) {
+	if strings.TrimSpace(content) == "" {
+		return content, nil, false
+	}
+
+	calls, ok := parseToolcallCompatFunctionCalls(content)
+	if !ok || len(calls) == 0 {
+		return content, nil, false
+	}
+
+	plain := stripToolcallCompatProtocol(content)
+	return plain, calls, true
+}
+
+func toolcallCompatIDSeed(idSeed string) string {
+	signal := strings.TrimSpace(idSeed)
 	if signal == "" {
 		return "compat"
 	}
-	lastUnderscore := strings.LastIndex(signal, "_")
-	if lastUnderscore == -1 || lastUnderscore == len(signal)-1 {
-		return "compat"
-	}
-	seed := signal[lastUnderscore+1:]
+	seed := signal
 	if len(seed) > 12 {
 		return seed[:12]
 	}
 	return seed
+}
+
+func parseToolcallCompatFunctionCalls(text string) ([]toolcallCompatFunctionCall, bool) {
+	blocks, ok := extractToolcallCompatFunctionCallBlocks(text)
+	if !ok || len(blocks) == 0 {
+		return nil, false
+	}
+
+	calls := make([]toolcallCompatFunctionCall, 0, len(blocks))
+	for _, block := range blocks {
+		call, ok := parseToolcallCompatFunctionCallBlock(block)
+		if !ok {
+			continue
+		}
+		calls = append(calls, call)
+	}
+	if len(calls) == 0 {
+		return nil, false
+	}
+	return calls, true
+}
+
+func extractToolcallCompatFunctionCallBlocks(text string) ([]string, bool) {
+	if strings.TrimSpace(text) == "" {
+		return nil, false
+	}
+
+	var blocks []string
+	s := text
+	for {
+		start := strings.Index(s, "<function_call>")
+		if start == -1 {
+			break
+		}
+		s = s[start+len("<function_call>"):]
+		end := strings.Index(s, "</function_call>")
+		if end == -1 {
+			return nil, false
+		}
+		block := strings.TrimSpace(s[:end])
+		block = stripCDATA(block)
+		blocks = append(blocks, strings.TrimSpace(block))
+		s = s[end+len("</function_call>"):]
+	}
+	if len(blocks) == 0 {
+		return nil, false
+	}
+	return blocks, true
+}
+
+func parseToolcallCompatFunctionCallBlock(block string) (toolcallCompatFunctionCall, bool) {
+	if name, args, ok := parseToolcallCompatLegacyBlock(block); ok {
+		return toolcallCompatFunctionCall{
+			ToolName: strings.TrimSpace(name),
+			ArgsJSON: strings.TrimSpace(args),
+		}, strings.TrimSpace(name) != ""
+	}
+	return parseToolcallCompatFunctionCallJSON(block)
+}
+
+func parseToolcallCompatLegacyBlock(block string) (string, string, bool) {
+	toolStart := strings.Index(block, "<tool>")
+	toolEnd := strings.Index(block, "</tool>")
+	if toolStart == -1 || toolEnd == -1 || toolEnd <= toolStart {
+		return "", "", false
+	}
+	name := strings.TrimSpace(block[toolStart+len("<tool>") : toolEnd])
+	if name == "" {
+		return "", "", false
+	}
+
+	argsStart := strings.Index(block, "<args_json>")
+	argsEnd := strings.Index(block, "</args_json>")
+	if argsStart == -1 || argsEnd == -1 || argsEnd <= argsStart {
+		return name, "", true
+	}
+	args := strings.TrimSpace(block[argsStart+len("<args_json>") : argsEnd])
+	args = stripCDATA(args)
+	return name, args, true
+}
+
+func parseToolcallCompatFunctionCallJSON(raw string) (toolcallCompatFunctionCall, bool) {
+	raw = strings.TrimSpace(stripCodeFences(raw))
+	if raw == "" {
+		return toolcallCompatFunctionCall{}, false
+	}
+
+	var v any
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		return toolcallCompatFunctionCall{}, false
+	}
+
+	obj, _ := v.(map[string]any)
+	if obj == nil {
+		return toolcallCompatFunctionCall{}, false
+	}
+
+	if _, ok := obj["function_call_record"]; ok {
+		return toolcallCompatFunctionCall{}, false
+	}
+
+	name, args := extractNameAndArgs(obj)
+	if strings.TrimSpace(name) == "" {
+		return toolcallCompatFunctionCall{}, false
+	}
+
+	argsJSON := "{}"
+	switch vv := args.(type) {
+	case nil:
+		argsJSON = "{}"
+	case string:
+		if strings.TrimSpace(vv) != "" {
+			argsJSON = strings.TrimSpace(vv)
+		}
+	default:
+		if b, err := json.Marshal(vv); err == nil {
+			argsJSON = string(b)
+		}
+	}
+
+	return toolcallCompatFunctionCall{
+		ToolName: strings.TrimSpace(name),
+		ArgsJSON: strings.TrimSpace(argsJSON),
+	}, true
+}
+
+func extractNameAndArgs(obj map[string]any) (string, any) {
+	if fc, ok := obj["function_call"].(map[string]any); ok {
+		if name, _ := fc["name"].(string); strings.TrimSpace(name) != "" {
+			return name, fc["arguments"]
+		}
+	}
+	if name, _ := obj["name"].(string); strings.TrimSpace(name) != "" {
+		return name, obj["arguments"]
+	}
+	if fn, ok := obj["function"].(map[string]any); ok {
+		if name, _ := fn["name"].(string); strings.TrimSpace(name) != "" {
+			return name, fn["arguments"]
+		}
+	}
+
+	// Fallback: if the object has exactly one key, try its nested object.
+	if len(obj) == 1 {
+		for _, v := range obj {
+			if nested, ok := v.(map[string]any); ok {
+				if name, _ := nested["name"].(string); strings.TrimSpace(name) != "" {
+					return name, nested["arguments"]
+				}
+			}
+		}
+	}
+	return "", nil
+}
+
+func stripCodeFences(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if !strings.HasPrefix(trimmed, "```") {
+		return trimmed
+	}
+	trimmed = strings.TrimPrefix(trimmed, "```")
+	trimmed = strings.TrimLeft(trimmed, " \t\r\n")
+	if idx := strings.Index(trimmed, "\n"); idx != -1 {
+		head := strings.TrimSpace(trimmed[:idx])
+		if head == "json" || head == "JSON" {
+			trimmed = trimmed[idx+1:]
+		}
+	}
+	trimmed = strings.TrimSuffix(trimmed, "```")
+	return strings.TrimSpace(trimmed)
+}
+
+func stripCDATA(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if strings.HasPrefix(trimmed, "<![CDATA[") && strings.HasSuffix(trimmed, "]]>") {
+		return strings.TrimSuffix(strings.TrimPrefix(trimmed, "<![CDATA["), "]]>")
+	}
+	return trimmed
+}
+
+func stripToolcallCompatProtocol(text string) string {
+	if strings.TrimSpace(text) == "" {
+		return ""
+	}
+
+	var out strings.Builder
+	s := text
+	for {
+		start := strings.Index(s, "<function_call>")
+		if start == -1 {
+			out.WriteString(s)
+			break
+		}
+		out.WriteString(s[:start])
+		s = s[start+len("<function_call>"):]
+		end := strings.Index(s, "</function_call>")
+		if end == -1 {
+			return strings.TrimSpace(text)
+		}
+		s = s[end+len("</function_call>"):]
+	}
+
+	plain := out.String()
+	plain = strings.ReplaceAll(plain, "<function_calls>", "")
+	plain = strings.ReplaceAll(plain, "</function_calls>", "")
+	plain = stripLegacyToolcallTriggerLines(plain)
+	return strings.TrimSpace(plain)
+}
+
+func stripLegacyToolcallTriggerLines(text string) string {
+	lines := strings.Split(text, "\n")
+	out := lines[:0]
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "TOOLCALL_COMPAT_TRIGGER_") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.TrimSpace(strings.Join(out, "\n"))
+}
+
+type toolcallCompatStreamDetector struct {
+	buf        string
+	thinkDepth int
+	triggered  bool
+}
+
+func newToolcallCompatStreamDetector() *toolcallCompatStreamDetector {
+	return &toolcallCompatStreamDetector{}
+}
+
+func (d *toolcallCompatStreamDetector) Process(delta string) (bool, string) {
+	if d.triggered {
+		return false, ""
+	}
+	if delta == "" {
+		return false, ""
+	}
+
+	d.buf += delta
+
+	holdback := len("<function_calls>")
+	if holdback < len("<function_call>") {
+		holdback = len("<function_call>")
+	}
+	if holdback < len("</function_call>") {
+		holdback = len("</function_call>")
+	}
+	if holdback < len("<think>") {
+		holdback = len("<think>")
+	}
+	if holdback < len("</think>") {
+		holdback = len("</think>")
+	}
+
+	var out strings.Builder
+	i := 0
+	for i < len(d.buf) {
+		if strings.HasPrefix(d.buf[i:], "<think>") {
+			d.thinkDepth++
+			out.WriteString("<think>")
+			i += len("<think>")
+			continue
+		}
+		if strings.HasPrefix(d.buf[i:], "</think>") {
+			if d.thinkDepth > 0 {
+				d.thinkDepth--
+			}
+			out.WriteString("</think>")
+			i += len("</think>")
+			continue
+		}
+
+		if d.thinkDepth == 0 && (strings.HasPrefix(d.buf[i:], "<function_call>") || strings.HasPrefix(d.buf[i:], "<function_calls>")) {
+			emitted := out.String()
+			d.buf = d.buf[i:]
+			d.triggered = true
+			return true, emitted
+		}
+
+		remaining := len(d.buf) - i
+		if remaining < holdback {
+			break
+		}
+
+		_, size := utf8.DecodeRuneInString(d.buf[i:])
+		if size <= 0 {
+			break
+		}
+		out.WriteString(d.buf[i : i+size])
+		i += size
+	}
+
+	d.buf = d.buf[i:]
+	return false, out.String()
+}
+
+func (d *toolcallCompatStreamDetector) TakeRemainder() string {
+	rest := d.buf
+	d.buf = ""
+	return rest
+}
+
+func (d *toolcallCompatStreamDetector) FlushRemainder() string {
+	if d.triggered {
+		return ""
+	}
+	return d.TakeRemainder()
+}
+
+func seedForLog(idSeed string) string {
+	s := strings.TrimSpace(idSeed)
+	if s == "" {
+		return "compat"
+	}
+	if len(s) > 12 {
+		return s[:12]
+	}
+	return s
 }

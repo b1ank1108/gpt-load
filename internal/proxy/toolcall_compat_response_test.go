@@ -7,11 +7,9 @@ import (
 )
 
 func TestRestoreToolCallsInChatCompletion_Success(t *testing.T) {
-	trigger := "TOOLCALL_COMPAT_TRIGGER_0123456789abcdef"
-	content := "Hello\n\n" + trigger + "\n" +
-		"<function_calls>" +
-		"<function_call><tool>get_weather</tool><args_json><![CDATA[{\"city\":\"SF\"}]]></args_json></function_call>" +
-		"</function_calls>"
+	idSeed := "0123456789abcdef"
+	content := "Hello\n\n" +
+		"<function_call>{\"function_call\":{\"name\":\"get_weather\",\"arguments\":{\"city\":\"SF\"}}}</function_call>"
 
 	in, err := json.Marshal(map[string]any{
 		"id": "chatcmpl_1",
@@ -30,7 +28,7 @@ func TestRestoreToolCallsInChatCompletion_Success(t *testing.T) {
 		t.Fatalf("marshal input: %v", err)
 	}
 
-	out, ok := restoreToolCallsInChatCompletion(in, trigger)
+	out, ok := restoreToolCallsInChatCompletion(in, idSeed)
 	if !ok {
 		t.Fatalf("expected restore ok")
 	}
@@ -81,7 +79,7 @@ func TestRestoreToolCallsInChatCompletion_PassthroughWhenNoTrigger(t *testing.T)
 		t.Fatalf("marshal input: %v", err)
 	}
 
-	out, ok := restoreToolCallsInChatCompletion(in, "TOOLCALL_COMPAT_TRIGGER_x")
+	out, ok := restoreToolCallsInChatCompletion(in, "compat")
 	if ok {
 		t.Fatalf("expected restore not ok")
 	}
@@ -91,8 +89,8 @@ func TestRestoreToolCallsInChatCompletion_PassthroughWhenNoTrigger(t *testing.T)
 }
 
 func TestRestoreToolCallsInChatCompletion_PassthroughWhenMalformedXML(t *testing.T) {
-	trigger := "TOOLCALL_COMPAT_TRIGGER_x"
-	content := "Hello\n" + trigger + "\n<function_calls><function_call><tool>get_weather</tool></function_call>"
+	idSeed := "compat"
+	content := "Hello\n<function_call><tool>get_weather</tool>"
 
 	in, err := json.Marshal(map[string]any{
 		"choices": []any{
@@ -110,7 +108,7 @@ func TestRestoreToolCallsInChatCompletion_PassthroughWhenMalformedXML(t *testing
 		t.Fatalf("marshal input: %v", err)
 	}
 
-	out, ok := restoreToolCallsInChatCompletion(in, trigger)
+	out, ok := restoreToolCallsInChatCompletion(in, idSeed)
 	if ok {
 		t.Fatalf("expected restore not ok")
 	}
@@ -120,10 +118,9 @@ func TestRestoreToolCallsInChatCompletion_PassthroughWhenMalformedXML(t *testing
 }
 
 func TestExtractToolcallCompatFunctionCalls_EmptyToolName(t *testing.T) {
-	trigger := "TOOLCALL_COMPAT_TRIGGER_x"
-	content := trigger + "\n<function_calls><function_call><tool> </tool><args_json><![CDATA[{}]]></args_json></function_call></function_calls>"
+	content := "<function_call>{\"function_call\":{\"name\":\" \",\"arguments\":{}}}</function_call>"
 
-	_, calls, ok := extractToolcallCompatFunctionCalls(content, trigger)
+	_, calls, ok := extractToolcallCompatFunctionCalls(content)
 	if ok || calls != nil {
 		t.Fatalf("expected extract not ok, got ok=%v calls=%#v", ok, calls)
 	}

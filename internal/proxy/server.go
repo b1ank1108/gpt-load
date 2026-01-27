@@ -31,6 +31,22 @@ type proxyResponseTransformer interface {
 	HandleUpstreamError(c *gin.Context, statusCode int, upstreamBody []byte) bool
 }
 
+func applyTransformerRequestHeaders(req *http.Request, transformer proxyResponseTransformer) {
+	if req == nil || transformer == nil {
+		return
+	}
+	req.Header.Del("Accept-Encoding")
+	req.Header.Set("Accept-Encoding", "identity")
+}
+
+func applyAnthropicStreamingUsage(anthropicTransformer *anthropicCompatTransformer, isStream bool, finalBodyBytes []byte) {
+	if anthropicTransformer == nil || !isStream {
+		return
+	}
+	inputTokens, tokenModel := estimateOpenAIRequestInputTokensAndModel(finalBodyBytes, "")
+	anthropicTransformer.WithStreamingUsage(tokenModel, inputTokens)
+}
+
 // ProxyServer represents the proxy server
 type ProxyServer struct {
 	keyProvider       *keypool.KeyProvider
@@ -109,16 +125,15 @@ func (ps *ProxyServer) HandleProxy(c *gin.Context) {
 	c.Request.Body.Close()
 
 	requestURL := c.Request.URL
-	effectivePath := c.Param("path")
+	originalPath := c.Param("path")
+	effectivePath := originalPath
 	requestBodyBytes := bodyBytes
 	var transformer proxyResponseTransformer
 	var anthropicTransformer *anthropicCompatTransformer
 
 	// Anthropic compatibility for OpenAI groups: accept /v1/messages and convert to /v1/chat/completions.
-	if group.ChannelType == "openai" &&
-		group.AnthropicCompat &&
-		c.Request.Method == http.MethodPost &&
-		c.Param("path") == "/v1/messages" {
+	anthropicCompatEligible := shouldApplyAnthropicCompat(group, c.Request.Method, originalPath)
+	if anthropicCompatEligible {
 		convertedBody, requestedModel, err := convertAnthropicMessagesToOpenAI(requestBodyBytes)
 		if err != nil {
 			response.Error(c, app_errors.NewAPIError(app_errors.ErrInvalidJSON, err.Error()))
@@ -142,10 +157,8 @@ func (ps *ProxyServer) HandleProxy(c *gin.Context) {
 	}
 
 	var toolcallMeta *toolcallCompatRequestMeta
-	if group.ChannelType == "openai" &&
-		group.ToolcallCompat &&
-		c.Request.Method == http.MethodPost &&
-		effectivePath == "/v1/chat/completions" {
+	toolcallCompatEligible := shouldApplyToolcallCompat(group, c.Request.Method, effectivePath)
+	if toolcallCompatEligible {
 		processedBody, meta, apiErr := preprocessToolcallCompatChatCompletionsRequest(finalBodyBytes)
 		if apiErr != nil {
 			response.Error(c, apiErr)
@@ -157,12 +170,26 @@ func (ps *ProxyServer) HandleProxy(c *gin.Context) {
 
 	isStream := channelHandler.IsStreamRequest(c, finalBodyBytes)
 
-	if anthropicTransformer != nil && toolcallMeta != nil && toolcallMeta.TriggerSignal != "" {
-		transformer = newAnthropicCompatWithToolcallCompatTransformer(anthropicTransformer, toolcallMeta.TriggerSignal)
+	applyAnthropicStreamingUsage(anthropicTransformer, isStream, finalBodyBytes)
+
+	if anthropicCompatEligible || toolcallCompatEligible {
+		logrus.WithFields(logrus.Fields{
+			"original_path":          originalPath,
+			"effective_path":         effectivePath,
+			"anthropic_compat":       anthropicTransformer != nil,
+			"toolcall_compat":        toolcallMeta != nil,
+			"anthropic_compat_scope": anthropicCompatEligible,
+			"toolcall_compat_scope":  toolcallCompatEligible,
+			"is_stream":              isStream,
+		}).Debug("proxy: compat decisions")
 	}
 
-	if transformer == nil && toolcallMeta != nil && toolcallMeta.TriggerSignal != "" {
-		transformer = newToolcallCompatTransformer(toolcallMeta.TriggerSignal)
+	if anthropicTransformer != nil && toolcallMeta != nil {
+		transformer = newAnthropicCompatWithToolcallCompatTransformer(anthropicTransformer, toolcallMeta.IDSeed)
+	}
+
+	if transformer == nil && toolcallMeta != nil {
+		transformer = newToolcallCompatTransformer(toolcallMeta.IDSeed)
 	}
 
 	ps.executeRequestWithRetry(c, channelHandler, originalGroup, group, requestURL, finalBodyBytes, isStream, startTime, 0, transformer)
@@ -243,6 +270,9 @@ func (ps *ProxyServer) executeRequestWithRetry(
 		headerCtx := utils.NewHeaderVariableContextFromGin(c, group, apiKey)
 		utils.ApplyHeaderRules(req, group.HeaderRuleList, headerCtx)
 	}
+
+	// Transformers parse upstream bodies (including SSE). Prevent compressed streams.
+	applyTransformerRequestHeaders(req, transformer)
 
 	var client *http.Client
 	if isStream {

@@ -11,14 +11,14 @@ import (
 )
 
 type anthropicCompatWithToolcallCompatTransformer struct {
-	base          *anthropicCompatTransformer
-	triggerSignal string
+	base   *anthropicCompatTransformer
+	idSeed string
 }
 
-func newAnthropicCompatWithToolcallCompatTransformer(base *anthropicCompatTransformer, triggerSignal string) *anthropicCompatWithToolcallCompatTransformer {
+func newAnthropicCompatWithToolcallCompatTransformer(base *anthropicCompatTransformer, idSeed string) *anthropicCompatWithToolcallCompatTransformer {
 	return &anthropicCompatWithToolcallCompatTransformer{
-		base:          base,
-		triggerSignal: triggerSignal,
+		base:   base,
+		idSeed: idSeed,
 	}
 }
 
@@ -33,7 +33,7 @@ func (t *anthropicCompatWithToolcallCompatTransformer) HandleSuccess(c *gin.Cont
 
 		go func() {
 			defer close(errCh)
-			err := transformOpenAIStreamToolcallCompat(resp.Body, openAISSEEmitter{w: pipeWriter}, t.triggerSignal)
+			err := transformOpenAIStreamToolcallCompat(resp.Body, openAISSEEmitter{w: pipeWriter}, t.idSeed)
 			if err != nil {
 				_ = pipeWriter.CloseWithError(err)
 				errCh <- err
@@ -69,10 +69,8 @@ func (t *anthropicCompatWithToolcallCompatTransformer) HandleSuccess(c *gin.Cont
 	}
 
 	toConvert := decompressed
-	if t.triggerSignal != "" {
-		if restored, ok := restoreToolCallsInChatCompletion(decompressed, t.triggerSignal); ok {
-			toConvert = restored
-		}
+	if restored, ok := restoreToolCallsInChatCompletion(decompressed, t.idSeed); ok {
+		toConvert = restored
 	}
 
 	converted, err := convertOpenAIChatCompletionToAnthropic(toConvert, t.base.requestedModel)

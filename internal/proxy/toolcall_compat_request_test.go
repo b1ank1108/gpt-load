@@ -34,7 +34,7 @@ func TestPreprocessToolcallCompatChatCompletionsRequest_ToolsInjectedAndRemoved(
 	if apiErr != nil {
 		t.Fatalf("unexpected api error: %v", apiErr)
 	}
-	if meta == nil || !strings.HasPrefix(meta.TriggerSignal, "TOOLCALL_COMPAT_TRIGGER_") {
+	if meta == nil || strings.TrimSpace(meta.IDSeed) == "" {
 		t.Fatalf("unexpected meta: %#v", meta)
 	}
 
@@ -58,8 +58,17 @@ func TestPreprocessToolcallCompatChatCompletionsRequest_ToolsInjectedAndRemoved(
 		t.Fatalf("expected system role, got %#v", sys["role"])
 	}
 	sysContent, _ := sys["content"].(string)
-	if !strings.Contains(sysContent, meta.TriggerSignal) {
-		t.Fatalf("system prompt missing trigger")
+	if !strings.Contains(sysContent, "<tool_list>") || !strings.Contains(sysContent, "</tool_list>") {
+		t.Fatalf("system prompt missing tool_list")
+	}
+	if !strings.Contains(sysContent, `name="get_weather"`) {
+		t.Fatalf("system prompt missing tool name")
+	}
+	if !strings.Contains(sysContent, "<function_call>") || !strings.Contains(sysContent, `"function_call"`) {
+		t.Fatalf("system prompt missing function_call format")
+	}
+	if !strings.Contains(sysContent, "必须调用工具") {
+		t.Fatalf("system prompt missing tool_choice hint")
 	}
 	user := msgs[1].(map[string]any)
 	if user["role"] != "user" || user["content"] != "Hello" {
@@ -96,9 +105,9 @@ func TestPreprocessToolcallCompatChatCompletionsRequest_AssistantToolCallsProtoc
 	}
 	content, _ := asst["content"].(string)
 	if !strings.Contains(content, "Calling tool") ||
-		!strings.Contains(content, meta.TriggerSignal) ||
-		!strings.Contains(content, "<tool>get_weather</tool>") ||
-		!strings.Contains(content, `{"city":"SF"}`) {
+		!strings.Contains(content, "<function_call>") ||
+		!strings.Contains(content, `"name":"get_weather"`) ||
+		!strings.Contains(content, `"city":"SF"`) {
 		t.Fatalf("unexpected assistant content: %q", content)
 	}
 }
@@ -145,10 +154,11 @@ func TestPreprocessToolcallCompatChatCompletionsRequest_ToolMessageBackrefConver
 		t.Fatalf("expected tool_call_id removed")
 	}
 	content, _ := toolMsg["content"].(string)
-	if !strings.Contains(content, "<tool_call_id>call1</tool_call_id>") ||
-		!strings.Contains(content, "<tool>get_weather</tool>") ||
-		!strings.Contains(content, `{"city":"SF"}`) ||
-		!strings.Contains(content, "Sunny") {
+	if !strings.Contains(content, "<function_call>") ||
+		!strings.Contains(content, `"function_call_record"`) ||
+		!strings.Contains(content, `"name":"get_weather"`) ||
+		!strings.Contains(content, `"city":"SF"`) ||
+		!strings.Contains(content, `"response":"Sunny"`) {
 		t.Fatalf("unexpected converted tool content: %q", content)
 	}
 }

@@ -14,11 +14,14 @@ import (
 	"gpt-load/internal/utils"
 
 	"github.com/gin-gonic/gin"
+	"github.com/sirupsen/logrus"
 )
 
 type anthropicCompatTransformer struct {
 	requestedModel string
 	messageID      string
+	tokenModel     string
+	inputTokens    int
 }
 
 func newAnthropicCompatTransformer(requestedModel string) *anthropicCompatTransformer {
@@ -26,6 +29,12 @@ func newAnthropicCompatTransformer(requestedModel string) *anthropicCompatTransf
 		requestedModel: requestedModel,
 		messageID:      fmt.Sprintf("msg_%d", time.Now().UnixNano()),
 	}
+}
+
+func (t *anthropicCompatTransformer) WithStreamingUsage(tokenModel string, inputTokens int) *anthropicCompatTransformer {
+	t.tokenModel = tokenModel
+	t.inputTokens = inputTokens
+	return t
 }
 
 func (t *anthropicCompatTransformer) HandleUpstreamError(c *gin.Context, statusCode int, upstreamBody []byte) bool {
@@ -653,7 +662,7 @@ func (t *anthropicCompatTransformer) streamOpenAIToAnthropic(c *gin.Context, res
 			"stop_reason":   nil,
 			"stop_sequence": nil,
 			"usage": map[string]any{
-				"input_tokens":  0,
+				"input_tokens":  t.inputTokens,
 				"output_tokens": 0,
 			},
 			"content": []any{},
@@ -671,6 +680,8 @@ func (t *anthropicCompatTransformer) streamOpenAIToAnthropic(c *gin.Context, res
 		currentToolBlockIndex = -1
 		currentToolBlockOpen  = false
 		lastFinishReason      = ""
+		tokenModel            = strings.TrimSpace(t.tokenModel)
+		outputTokens          = 0
 	)
 
 	reader := bufio.NewReader(resp.Body)
@@ -771,6 +782,11 @@ func (t *anthropicCompatTransformer) streamOpenAIToAnthropic(c *gin.Context, res
 			if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 				continue
 			}
+			if tokenModel == "" {
+				if m, ok := chunk["model"].(string); ok && strings.TrimSpace(m) != "" {
+					tokenModel = m
+				}
+			}
 
 			choices, _ := chunk["choices"].([]any)
 			if len(choices) == 0 {
@@ -803,6 +819,7 @@ func (t *anthropicCompatTransformer) streamOpenAIToAnthropic(c *gin.Context, res
 				}); err != nil {
 					return err
 				}
+				outputTokens += estimateTokens(content, tokenModel)
 				flusher.Flush()
 			}
 
@@ -843,6 +860,7 @@ func (t *anthropicCompatTransformer) streamOpenAIToAnthropic(c *gin.Context, res
 						}); err != nil {
 							return err
 						}
+						outputTokens += estimateTokens(argsPart, tokenModel)
 					}
 					flusher.Flush()
 				}
@@ -872,7 +890,7 @@ func (t *anthropicCompatTransformer) streamOpenAIToAnthropic(c *gin.Context, res
 			"stop_sequence": nil,
 		},
 		"usage": map[string]any{
-			"output_tokens": 0,
+			"output_tokens": outputTokens,
 		},
 	}); err != nil {
 		return err
@@ -883,6 +901,11 @@ func (t *anthropicCompatTransformer) streamOpenAIToAnthropic(c *gin.Context, res
 		return err
 	}
 	flusher.Flush()
+	logrus.WithFields(logrus.Fields{
+		"input_tokens":  t.inputTokens,
+		"output_tokens": outputTokens,
+		"token_model":   tokenModel,
+	}).Debug("anthropic compat: streaming usage estimated")
 	return nil
 }
 
