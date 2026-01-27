@@ -184,7 +184,6 @@ tramp
 *.iml
 *.ipr
 *.iws
-
 # Local configuration override
 config.local.json
 config.local.yaml
@@ -215,4 +214,3 @@ start-local.sh
 dev-setup.sh
 data/
 .ace-tool/
-openspec/
