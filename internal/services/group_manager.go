@@ -66,11 +66,12 @@ func (gm *GroupManager) Initialize() error {
 			groupByID[group.ID] = group
 		}
 
-		groupMap := make(map[string]*models.Group, len(groups))
-		for _, group := range groups {
-			g := *group
-			g.EffectiveConfig = gm.settingsManager.GetEffectiveConfig(g.Config)
-			g.ProxyKeysMap = utils.StringToSet(g.ProxyKeys, ",")
+			groupMap := make(map[string]*models.Group, len(groups))
+			for _, group := range groups {
+				g := *group
+				normalizeToolcallCompat(&g)
+				g.EffectiveConfig = gm.settingsManager.GetEffectiveConfig(g.Config)
+				g.ProxyKeysMap = utils.StringToSet(g.ProxyKeys, ",")
 
 			// Parse header rules with error handling
 			if len(group.HeaderRules) > 0 {

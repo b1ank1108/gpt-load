@@ -90,6 +90,8 @@ type GroupCreateParams struct {
 	GroupType           string
 	Upstreams           json.RawMessage
 	ChannelType         string
+	AnthropicCompat     bool
+	ToolcallCompat      bool
 	Sort                int
 	TestModel           string
 	ValidationEndpoint  string
@@ -111,6 +113,8 @@ type GroupUpdateParams struct {
 	Upstreams           json.RawMessage
 	HasUpstreams        bool
 	ChannelType         *string
+	AnthropicCompat     *bool
+	ToolcallCompat      *bool
 	Sort                *int
 	TestModel           string
 	HasTestModel        bool
@@ -231,6 +235,8 @@ func (s *GroupService) CreateGroup(ctx context.Context, params GroupCreateParams
 		GroupType:           groupType,
 		Upstreams:           cleanedUpstreams,
 		ChannelType:         channelType,
+		AnthropicCompat:     params.AnthropicCompat,
+		ToolcallCompat:      params.ToolcallCompat,
 		Sort:                params.Sort,
 		TestModel:           testModel,
 		ValidationEndpoint:  validationEndpoint,
@@ -241,6 +247,7 @@ func (s *GroupService) CreateGroup(ctx context.Context, params GroupCreateParams
 		HeaderRules:         headerRulesJSON,
 		ProxyKeys:           strings.TrimSpace(params.ProxyKeys),
 	}
+	normalizeToolcallCompat(&group)
 
 	tx := s.db.WithContext(ctx).Begin()
 	if err := tx.Error; err != nil {
@@ -347,6 +354,14 @@ func (s *GroupService) UpdateGroup(ctx context.Context, id uint, params GroupUpd
 		group.ChannelType = cleanedChannelType
 	}
 
+	if params.AnthropicCompat != nil {
+		group.AnthropicCompat = *params.AnthropicCompat
+	}
+
+	if params.ToolcallCompat != nil {
+		group.ToolcallCompat = *params.ToolcallCompat
+	}
+
 	if params.Sort != nil {
 		group.Sort = *params.Sort
 	}
@@ -410,6 +425,8 @@ func (s *GroupService) UpdateGroup(ctx context.Context, id uint, params GroupUpd
 		}
 		group.HeaderRules = headerRulesJSON
 	}
+
+	normalizeToolcallCompat(&group)
 
 	if err := tx.Save(&group).Error; err != nil {
 		return nil, app_errors.ParseDBError(err)
@@ -521,6 +538,7 @@ func (s *GroupService) CopyGroup(ctx context.Context, sourceGroupID uint, copyKe
 	newGroup.CreatedAt = time.Time{}
 	newGroup.UpdatedAt = time.Time{}
 	newGroup.LastValidatedAt = nil
+	normalizeToolcallCompat(&newGroup)
 
 	if err := tx.Create(&newGroup).Error; err != nil {
 		return nil, app_errors.ParseDBError(err)

@@ -51,6 +51,8 @@ type GroupCreateRequest struct {
 	GroupType           string              `json:"group_type"` // 'standard' or 'aggregate'
 	Upstreams           json.RawMessage     `json:"upstreams"`
 	ChannelType         string              `json:"channel_type"`
+	AnthropicCompat     bool                `json:"anthropic_compat"`
+	ToolcallCompat      bool                `json:"toolcall_compat"`
 	Sort                int                 `json:"sort"`
 	TestModel           string              `json:"test_model"`
 	ValidationEndpoint  string              `json:"validation_endpoint"`
@@ -77,6 +79,8 @@ func (s *Server) CreateGroup(c *gin.Context) {
 		GroupType:           req.GroupType,
 		Upstreams:           req.Upstreams,
 		ChannelType:         req.ChannelType,
+		AnthropicCompat:     req.AnthropicCompat,
+		ToolcallCompat:      req.ToolcallCompat,
 		Sort:                req.Sort,
 		TestModel:           req.TestModel,
 		ValidationEndpoint:  req.ValidationEndpoint,
@@ -120,6 +124,8 @@ type GroupUpdateRequest struct {
 	GroupType           *string             `json:"group_type,omitempty"`
 	Upstreams           json.RawMessage     `json:"upstreams"`
 	ChannelType         *string             `json:"channel_type,omitempty"`
+	AnthropicCompat     *bool               `json:"anthropic_compat"`
+	ToolcallCompat      *bool               `json:"toolcall_compat"`
 	Sort                *int                `json:"sort"`
 	TestModel           string              `json:"test_model"`
 	ValidationEndpoint  *string             `json:"validation_endpoint,omitempty"`
@@ -151,6 +157,8 @@ func (s *Server) UpdateGroup(c *gin.Context) {
 		Description:         req.Description,
 		GroupType:           req.GroupType,
 		ChannelType:         req.ChannelType,
+		AnthropicCompat:     req.AnthropicCompat,
+		ToolcallCompat:      req.ToolcallCompat,
 		Sort:                req.Sort,
 		ValidationEndpoint:  req.ValidationEndpoint,
 		ParamOverrides:      req.ParamOverrides,
@@ -193,6 +201,8 @@ type GroupResponse struct {
 	GroupType           string              `json:"group_type"`
 	Upstreams           datatypes.JSON      `json:"upstreams"`
 	ChannelType         string              `json:"channel_type"`
+	AnthropicCompat     bool                `json:"anthropic_compat"`
+	ToolcallCompat      bool                `json:"toolcall_compat"`
 	Sort                int                 `json:"sort"`
 	TestModel           string              `json:"test_model"`
 	ValidationEndpoint  string              `json:"validation_endpoint"`
@@ -237,6 +247,8 @@ func (s *Server) newGroupResponse(group *models.Group) *GroupResponse {
 		GroupType:           group.GroupType,
 		Upstreams:           group.Upstreams,
 		ChannelType:         group.ChannelType,
+		AnthropicCompat:     group.AnthropicCompat,
+		ToolcallCompat:      group.ToolcallCompat,
 		Sort:                group.Sort,
 		TestModel:           group.TestModel,
 		ValidationEndpoint:  group.ValidationEndpoint,

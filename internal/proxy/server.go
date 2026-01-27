@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"gpt-load/internal/channel"
@@ -24,6 +25,11 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 )
+
+type proxyResponseTransformer interface {
+	HandleSuccess(c *gin.Context, resp *http.Response, isStream bool) error
+	HandleUpstreamError(c *gin.Context, statusCode int, upstreamBody []byte) bool
+}
 
 // ProxyServer represents the proxy server
 type ProxyServer struct {
@@ -102,15 +108,64 @@ func (ps *ProxyServer) HandleProxy(c *gin.Context) {
 	}
 	c.Request.Body.Close()
 
-	finalBodyBytes, err := ps.applyParamOverrides(bodyBytes, group)
+	requestURL := c.Request.URL
+	effectivePath := c.Param("path")
+	requestBodyBytes := bodyBytes
+	var transformer proxyResponseTransformer
+	var anthropicTransformer *anthropicCompatTransformer
+
+	// Anthropic compatibility for OpenAI groups: accept /v1/messages and convert to /v1/chat/completions.
+	if group.ChannelType == "openai" &&
+		group.AnthropicCompat &&
+		c.Request.Method == http.MethodPost &&
+		c.Param("path") == "/v1/messages" {
+		convertedBody, requestedModel, err := convertAnthropicMessagesToOpenAI(requestBodyBytes)
+		if err != nil {
+			response.Error(c, app_errors.NewAPIError(app_errors.ErrInvalidJSON, err.Error()))
+			return
+		}
+		requestBodyBytes = convertedBody
+		anthropicTransformer = newAnthropicCompatTransformer(requestedModel)
+		transformer = anthropicTransformer
+
+		// Rewrite request path for upstream routing (keep original group prefix).
+		urlCopy := *c.Request.URL
+		urlCopy.Path = "/proxy/" + originalGroup.Name + "/v1/chat/completions"
+		requestURL = &urlCopy
+		effectivePath = "/v1/chat/completions"
+	}
+
+	finalBodyBytes, err := ps.applyParamOverrides(requestBodyBytes, group)
 	if err != nil {
 		response.Error(c, app_errors.NewAPIError(app_errors.ErrInternalServer, fmt.Sprintf("Failed to apply parameter overrides: %v", err)))
 		return
 	}
 
-	isStream := channelHandler.IsStreamRequest(c, bodyBytes)
+	var toolcallMeta *toolcallCompatRequestMeta
+	if group.ChannelType == "openai" &&
+		group.ToolcallCompat &&
+		c.Request.Method == http.MethodPost &&
+		effectivePath == "/v1/chat/completions" {
+		processedBody, meta, apiErr := preprocessToolcallCompatChatCompletionsRequest(finalBodyBytes)
+		if apiErr != nil {
+			response.Error(c, apiErr)
+			return
+		}
+		finalBodyBytes = processedBody
+		toolcallMeta = meta
+	}
 
-	ps.executeRequestWithRetry(c, channelHandler, originalGroup, group, finalBodyBytes, isStream, startTime, 0)
+	isStream := channelHandler.IsStreamRequest(c, finalBodyBytes)
+
+	if anthropicTransformer != nil && toolcallMeta != nil && toolcallMeta.TriggerSignal != "" {
+		transformer = newAnthropicCompatWithToolcallCompatTransformer(anthropicTransformer, toolcallMeta.TriggerSignal)
+	}
+
+	if transformer == nil && toolcallMeta != nil && toolcallMeta.TriggerSignal != "" {
+		transformer = newToolcallCompatTransformer(toolcallMeta.TriggerSignal)
+	}
+
+	ps.executeRequestWithRetry(c, channelHandler, originalGroup, group, requestURL, finalBodyBytes, isStream, startTime, 0, transformer)
 }
 
 // executeRequestWithRetry is the core recursive function for handling requests and retries.
@@ -119,10 +174,12 @@ func (ps *ProxyServer) executeRequestWithRetry(
 	channelHandler channel.ChannelProxy,
 	originalGroup *models.Group,
 	group *models.Group,
+	requestURL *url.URL,
 	bodyBytes []byte,
 	isStream bool,
 	startTime time.Time,
 	retryCount int,
+	transformer proxyResponseTransformer,
 ) {
 	cfg := group.EffectiveConfig
 
@@ -134,7 +191,7 @@ func (ps *ProxyServer) executeRequestWithRetry(
 		return
 	}
 
-	upstreamURL, err := channelHandler.BuildUpstreamURL(c.Request.URL, originalGroup.Name)
+	upstreamURL, err := channelHandler.BuildUpstreamURL(requestURL, originalGroup.Name)
 	if err != nil {
 		response.Error(c, app_errors.NewAPIError(app_errors.ErrInternalServer, fmt.Sprintf("Failed to build upstream URL: %v", err)))
 		return
@@ -246,6 +303,11 @@ func (ps *ProxyServer) executeRequestWithRetry(
 
 		// 如果是最后一次尝试，直接返回错误，不再递归
 		if isLastAttempt {
+			if transformer != nil && err == nil && resp != nil {
+				if transformer.HandleUpstreamError(c, statusCode, []byte(errorMessage)) {
+					return
+				}
+			}
 			var errorJSON map[string]any
 			if err := json.Unmarshal([]byte(errorMessage), &errorJSON); err == nil {
 				c.JSON(statusCode, errorJSON)
@@ -255,28 +317,36 @@ func (ps *ProxyServer) executeRequestWithRetry(
 			return
 		}
 
-		ps.executeRequestWithRetry(c, channelHandler, originalGroup, group, bodyBytes, isStream, startTime, retryCount+1)
+		ps.executeRequestWithRetry(c, channelHandler, originalGroup, group, requestURL, bodyBytes, isStream, startTime, retryCount+1, transformer)
 		return
 	}
 
 	// ps.keyProvider.UpdateStatus(apiKey, group, true) // 请求成功不再重置成功次数，减少IO消耗
 	logrus.Debugf("Request for group %s succeeded on attempt %d with key %s", group.Name, retryCount+1, utils.MaskAPIKey(apiKey.KeyValue))
 
-	// Check if this is a model list request (needs special handling)
-	if shouldInterceptModelList(c.Request.URL.Path, c.Request.Method) {
-		ps.handleModelListResponse(c, resp, group, channelHandler)
-	} else {
-		for key, values := range resp.Header {
-			for _, value := range values {
-				c.Header(key, value)
-			}
+	if transformer != nil {
+		if err := transformer.HandleSuccess(c, resp, isStream); err != nil {
+			logrus.WithError(err).Error("Failed to transform proxy response")
+			response.Error(c, app_errors.ErrInternalServer)
+			return
 		}
-		c.Status(resp.StatusCode)
-
-		if isStream {
-			ps.handleStreamingResponse(c, resp)
+	} else {
+		// Check if this is a model list request (needs special handling)
+		if shouldInterceptModelList(c.Request.URL.Path, c.Request.Method) {
+			ps.handleModelListResponse(c, resp, group, channelHandler)
 		} else {
-			ps.handleNormalResponse(c, resp)
+			for key, values := range resp.Header {
+				for _, value := range values {
+					c.Header(key, value)
+				}
+			}
+			c.Status(resp.StatusCode)
+
+			if isStream {
+				ps.handleStreamingResponse(c, resp)
+			} else {
+				ps.handleNormalResponse(c, resp)
+			}
 		}
 	}
 
