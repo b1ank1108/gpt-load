@@ -70,6 +70,8 @@ export interface Group {
   sort: number;
   test_model: string;
   channel_type: ChannelType;
+  anthropic_compat?: boolean;
+  toolcall_compat?: boolean;
   upstreams: UpstreamInfo[];
   validation_endpoint: string;
   config: Record<string, unknown>;

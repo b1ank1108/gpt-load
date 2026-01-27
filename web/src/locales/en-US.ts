@@ -227,6 +227,12 @@ export default {
     basicInfo: "Basic Information",
     displayName: "Display Name",
     channelType: "Channel Type",
+    anthropicCompat: "Anthropic Compatibility",
+    anthropicCompatTooltip:
+      "Only for OpenAI groups: enables Anthropic `/v1/messages` (auto-converted to OpenAI `/v1/chat/completions` and converted back in responses)",
+    toolcallCompat: "Tool Call Compatibility",
+    toolcallCompatTooltip:
+      "Only for OpenAI standard groups: converts tools/tool_calls to a prompt+text protocol for upstreams without native tool calling",
     sortOrder: "Sort Order",
     testModel: "Test Model",
     testPath: "Test Path",

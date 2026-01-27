@@ -226,6 +226,12 @@ export default {
     basicInfo: "基本情報",
     displayName: "表示名",
     channelType: "チャンネルタイプ",
+    anthropicCompat: "Anthropic 互換モード",
+    anthropicCompatTooltip:
+      "OpenAI グループのみ有効：Anthropic `/v1/messages` を利用可能（OpenAI `/v1/chat/completions` に自動変換し、レスポンスも Anthropic 形式へ変換）",
+    toolcallCompat: "Tool Call 互換モード",
+    toolcallCompatTooltip:
+      "OpenAI 標準グループのみ有効：tools/tool_calls をプロンプト+テキストプロトコルに変換し、ネイティブ tool calling 非対応の上流に対応",
     sortOrder: "並び順",
     testModel: "テストモデル",
     testPath: "テストパス",

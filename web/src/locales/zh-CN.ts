@@ -223,6 +223,12 @@ export default {
     basicInfo: "基础信息",
     displayName: "显示名称",
     channelType: "渠道类型",
+    anthropicCompat: "Anthropic 兼容模式",
+    anthropicCompatTooltip:
+      "仅对 OpenAI 分组生效：开启后可使用 Anthropic `/v1/messages` 调用（会自动转为 OpenAI `/v1/chat/completions` 并将响应转回 Anthropic 格式）",
+    toolcallCompat: "Tool Call 兼容模式",
+    toolcallCompatTooltip:
+      "仅对 OpenAI 标准分组生效：将 tools/tool_calls 等转换为提示词+文本协议，适配不支持原生工具调用的上游",
     sortOrder: "排序",
     testModel: "测试模型",
     testPath: "测试路径",

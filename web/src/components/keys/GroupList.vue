@@ -2,7 +2,7 @@
 import type { Group } from "@/types/models";
 import { getGroupDisplayName } from "@/utils/display";
 import { Add, LinkOutline, Search } from "@vicons/ionicons5";
-import { NButton, NCard, NEmpty, NInput, NSpin, NTag } from "naive-ui";
+import { NButton, NCard, NEmpty, NInput, NSpin, NTag, NTooltip } from "naive-ui";
 import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import AggregateGroupModal from "./AggregateGroupModal.vue";
@@ -86,6 +86,22 @@ function getChannelTagType(channelType: string) {
   }
 }
 
+function shouldShowAnthropicCompatIndicator(group: Group): boolean {
+  return (
+    group.channel_type === "openai" &&
+    group.group_type !== "aggregate" &&
+    group.anthropic_compat === true
+  );
+}
+
+function shouldShowToolcallCompatIndicator(group: Group): boolean {
+  return (
+    group.channel_type === "openai" &&
+    group.group_type !== "aggregate" &&
+    group.toolcall_compat === true
+  );
+}
+
 function openCreateGroupModal() {
   showGroupModal.value = true;
 }
@@ -153,7 +169,29 @@ function handleGroupCreated(group: Group) {
                 <span v-else>🔧</span>
               </div>
               <div class="group-content">
-                <div class="group-name">{{ getGroupDisplayName(group) }}</div>
+                <div class="group-name">
+                  <span class="group-name-text">{{ getGroupDisplayName(group) }}</span>
+                  <n-tooltip
+                    v-if="shouldShowAnthropicCompatIndicator(group)"
+                    trigger="hover"
+                    placement="top"
+                  >
+                    <template #trigger>
+                      <span class="anthropic-compat-indicator">🧠</span>
+                    </template>
+                    {{ t("keys.anthropicCompatTooltip") }}
+                  </n-tooltip>
+                  <n-tooltip
+                    v-if="shouldShowToolcallCompatIndicator(group)"
+                    trigger="hover"
+                    placement="top"
+                  >
+                    <template #trigger>
+                      <span class="toolcall-compat-indicator">🛠️</span>
+                    </template>
+                    {{ t("keys.toolcallCompatTooltip") }}
+                  </n-tooltip>
+                </div>
                 <div class="group-meta">
                   <n-tag size="tiny" :type="getChannelTagType(group.channel_type)">
                     {{ group.channel_type }}
@@ -331,13 +369,30 @@ function handleGroupCreated(group: Group) {
 }
 
 .group-name {
+  display: flex;
+  align-items: center;
+  gap: 4px;
   font-weight: 600;
   font-size: 14px;
   line-height: 1.2;
   margin-bottom: 4px;
+  min-width: 0;
+}
+
+.group-name-text {
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
+}
+
+.anthropic-compat-indicator {
+  flex-shrink: 0;
+}
+
+.toolcall-compat-indicator {
+  flex-shrink: 0;
 }
 
 .group-meta {

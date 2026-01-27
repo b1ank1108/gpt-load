@@ -68,6 +68,8 @@ interface GroupFormData {
   description: string;
   upstreams: UpstreamInfo[];
   channel_type: "anthropic" | "gemini" | "openai";
+  anthropic_compat: boolean;
+  toolcall_compat: boolean;
   sort: number;
   test_model: string;
   validation_endpoint: string;
@@ -93,6 +95,8 @@ const formData = reactive<GroupFormData>({
     },
   ] as UpstreamInfo[],
   channel_type: "openai",
+  anthropic_compat: false,
+  toolcall_compat: false,
   sort: 1,
   test_model: "",
   validation_endpoint: "",
@@ -217,7 +221,11 @@ watch(
 // 监听渠道类型变化，在新增模式下智能更新默认值
 watch(
   () => formData.channel_type,
-  (_newChannelType, oldChannelType) => {
+  (newChannelType, oldChannelType) => {
+    if (newChannelType !== "openai") {
+      formData.anthropic_compat = false;
+      formData.toolcall_compat = false;
+    }
     if (!props.group && oldChannelType) {
       // 仅在新增模式且不是初始设置时处理
       // 检查测试模型是否应该更新（为空或是旧渠道类型的默认值）
@@ -238,6 +246,15 @@ watch(
         formData.upstreams[0].url = upstreamPlaceholder.value;
         userModifiedFields.value.upstream = false;
       }
+    }
+  }
+);
+
+watch(
+  () => formData.group_type,
+  groupType => {
+    if (groupType === "aggregate") {
+      formData.toolcall_compat = false;
     }
   }
 );
@@ -288,6 +305,8 @@ function resetForm() {
       },
     ],
     channel_type: defaultChannelType,
+    anthropic_compat: false,
+    toolcall_compat: false,
     sort: 1,
     test_model: isCreateMode ? testModelPlaceholder.value : "",
     validation_endpoint: "",
@@ -330,6 +349,8 @@ function loadGroupData() {
       ? [...props.group.upstreams]
       : [{ url: "", weight: 1 }],
     channel_type: props.group.channel_type || "openai",
+    anthropic_compat: props.group.anthropic_compat || false,
+    toolcall_compat: props.group.toolcall_compat || false,
     sort: props.group.sort || 1,
     test_model: props.group.test_model || "",
     validation_endpoint: props.group.validation_endpoint || "",
@@ -511,6 +532,13 @@ async function handleSubmit() {
       }
     });
 
+    if (formData.channel_type !== "openai") {
+      formData.anthropic_compat = false;
+    }
+    if (formData.channel_type !== "openai" || formData.group_type === "aggregate") {
+      formData.toolcall_compat = false;
+    }
+
     // 构建提交数据
     const submitData = {
       name: formData.name,
@@ -518,6 +546,8 @@ async function handleSubmit() {
       description: formData.description,
       upstreams: formData.upstreams.filter((upstream: UpstreamInfo) => upstream.url.trim()),
       channel_type: formData.channel_type,
+      anthropic_compat: formData.anthropic_compat,
+      toolcall_compat: formData.toolcall_compat,
       sort: formData.sort,
       test_model: formData.test_model,
       validation_endpoint: formData.validation_endpoint,
@@ -843,6 +873,39 @@ async function handleSubmit() {
           <n-collapse>
             <n-collapse-item name="advanced">
               <template #header>{{ t("keys.advancedConfig") }}</template>
+              <div
+                v-if="formData.channel_type === 'openai' && formData.group_type !== 'aggregate'"
+                class="config-section"
+              >
+                <n-form-item :label="t('keys.anthropicCompat')" path="anthropic_compat">
+                  <template #label>
+                    <div class="form-label-with-tooltip">
+                      {{ t("keys.anthropicCompat") }}
+                      <n-tooltip trigger="hover" placement="top">
+                        <template #trigger>
+                          <n-icon :component="HelpCircleOutline" class="help-icon config-help" />
+                        </template>
+                        {{ t("keys.anthropicCompatTooltip") }}
+                      </n-tooltip>
+                    </div>
+                  </template>
+                  <n-switch v-model:value="formData.anthropic_compat" />
+                </n-form-item>
+                <n-form-item :label="t('keys.toolcallCompat')" path="toolcall_compat">
+                  <template #label>
+                    <div class="form-label-with-tooltip">
+                      {{ t("keys.toolcallCompat") }}
+                      <n-tooltip trigger="hover" placement="top">
+                        <template #trigger>
+                          <n-icon :component="HelpCircleOutline" class="help-icon config-help" />
+                        </template>
+                        {{ t("keys.toolcallCompatTooltip") }}
+                      </n-tooltip>
+                    </div>
+                  </template>
+                  <n-switch v-model:value="formData.toolcall_compat" />
+                </n-form-item>
+              </div>
               <div class="config-section">
                 <h5 class="config-title-with-tooltip">
                   {{ t("keys.groupConfig") }}

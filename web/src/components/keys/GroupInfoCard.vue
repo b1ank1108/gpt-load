@@ -555,6 +555,16 @@ function resetPage() {
                         {{ group?.channel_type }}
                       </n-form-item>
                     </n-grid-item>
+                    <n-grid-item v-if="!isAggregateGroup && group?.channel_type === 'openai'">
+                      <n-form-item :label="`${t('keys.anthropicCompat')}：`">
+                        {{ t(group?.anthropic_compat ? "common.enable" : "common.disable") }}
+                      </n-form-item>
+                    </n-grid-item>
+                    <n-grid-item v-if="!isAggregateGroup && group?.channel_type === 'openai'">
+                      <n-form-item :label="`${t('keys.toolcallCompat')}：`">
+                        {{ t(group?.toolcall_compat ? "common.enable" : "common.disable") }}
+                      </n-form-item>
+                    </n-grid-item>
                     <n-grid-item>
                       <n-form-item :label="`${t('keys.sortOrder')}：`">
                         {{ group?.sort }}
