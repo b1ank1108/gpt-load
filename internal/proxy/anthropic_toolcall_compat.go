@@ -92,17 +92,18 @@ func (t *anthropicCompatWithToolcallCompatTransformer) convertOpenAIToAnthropicW
 	toolCalls := extractOpenAIToolCalls(msgObj["tool_calls"])
 
 	if len(toolCalls) == 0 {
-		plain, call, triggered, parsed := extractToolcallCompatInvokeCall(contentText, t.trigger)
+		plain, calls, triggered, parsed := extractToolcallCompatInvokeCalls(contentText, t.trigger)
 		if triggered {
 			contentText = plain
 			if parsed {
 				seed := toolcallCompatIDSeed(t.idSeed)
-				toolCalls = []openAIToolCall{
-					{
-						ID:        fmt.Sprintf("call_%s_%d", seed, 1),
+				toolCalls = make([]openAIToolCall, 0, len(calls))
+				for i, call := range calls {
+					toolCalls = append(toolCalls, openAIToolCall{
+						ID:        fmt.Sprintf("call_%s_%d", seed, i+1),
 						Name:      strings.TrimSpace(call.ToolName),
 						Arguments: strings.TrimSpace(call.ArgsJSON),
-					},
+					})
 				}
 			}
 		}
@@ -362,14 +363,22 @@ func (t *anthropicCompatWithToolcallCompatTransformer) streamOpenAIToAnthropicWi
 	protocolBuffer := ""
 
 	finalizeProtocol := func() error {
-		invokeXML, ok := extractFirstInvokeXML(protocolBuffer)
+		invokes, ok := extractAllInvokeXML(protocolBuffer)
 		if ok {
-			call, parsed := parseToolcallCompatInvokeXML(invokeXML)
-			if parsed {
+			calls := make([]toolcallCompatInvokeCall, 0, len(invokes))
+			for _, invokeXML := range invokes {
+				call, parsed := parseToolcallCompatInvokeXML(invokeXML)
+				if parsed {
+					calls = append(calls, call)
+				}
+			}
+			if len(calls) > 0 {
 				seed := toolcallCompatIDSeed(t.idSeed)
-				toolID := fmt.Sprintf("call_%s_%d", seed, 1)
-				if err := emitToolUse(toolID, strings.TrimSpace(call.ToolName), call.ArgsJSON, 0); err != nil {
-					return err
+				for i, call := range calls {
+					toolID := fmt.Sprintf("call_%s_%d", seed, i+1)
+					if err := emitToolUse(toolID, strings.TrimSpace(call.ToolName), call.ArgsJSON, i); err != nil {
+						return err
+					}
 				}
 				lastFinishReason = "tool_calls"
 				return finishStream()
@@ -436,21 +445,19 @@ func (t *anthropicCompatWithToolcallCompatTransformer) streamOpenAIToAnthropicWi
 					if err := emitTextDelta(content); err != nil {
 						return err
 					}
-				} else if protocolTriggered {
-					protocolBuffer += content
-					if len(protocolBuffer) > maxProtocolBufferBytes {
-						protocolFallback = true
-						protocolTriggered = false
+					} else if protocolTriggered {
+						protocolBuffer += content
+						if len(protocolBuffer) > maxProtocolBufferBytes {
+							protocolFallback = true
+							protocolTriggered = false
 						if err := emitTextDelta(protocolBuffer); err != nil {
 							return err
+							}
+							protocolBuffer = ""
 						}
-						protocolBuffer = ""
-					} else if toolcallCompatInvokeEndRE.MatchString(protocolBuffer) {
-						return finalizeProtocol()
-					}
-				} else {
-					detected, emitText := detector.Process(content)
-					if emitText != "" {
+					} else {
+						detected, emitText := detector.Process(content)
+						if emitText != "" {
 						if err := emitTextDelta(emitText); err != nil {
 							return err
 						}
@@ -458,19 +465,17 @@ func (t *anthropicCompatWithToolcallCompatTransformer) streamOpenAIToAnthropicWi
 					if detected {
 						protocolTriggered = true
 						protocolBuffer = detector.TakeRemainder()
-						if len(protocolBuffer) > maxProtocolBufferBytes {
-							protocolFallback = true
-							protocolTriggered = false
+							if len(protocolBuffer) > maxProtocolBufferBytes {
+								protocolFallback = true
+								protocolTriggered = false
 							if err := emitTextDelta(protocolBuffer); err != nil {
 								return err
+								}
+								protocolBuffer = ""
 							}
-							protocolBuffer = ""
-						} else if toolcallCompatInvokeEndRE.MatchString(protocolBuffer) {
-							return finalizeProtocol()
 						}
 					}
 				}
-			}
 
 			if toolCallsAny, ok := delta["tool_calls"].([]any); ok && len(toolCallsAny) > 0 {
 				if err := closeTextBlock(); err != nil {

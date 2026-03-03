@@ -258,23 +258,31 @@ func transformOpenAIStreamToolcallCompat(r io.Reader, emitter openAISSEEmitter, 
 	}
 
 	finalizeFromProtocol := func() error {
-		invokeXML, ok := extractFirstInvokeXML(protocolBuffer)
+		invokes, ok := extractAllInvokeXML(protocolBuffer)
 		if !ok {
 			logrus.WithField("seed", seedForLog(idSeed)).Debug("toolcall compat: stream invoke missing or incomplete")
 			logrus.WithField("seed", seedForLog(idSeed)).Warn("toolcall compat: failed to parse invoke from stream")
 			return emitProtocolTextAndStop(strings.TrimSpace(protocolBuffer))
 		}
-		call, ok := parseToolcallCompatInvokeXML(invokeXML)
-		if !ok {
+
+		calls := make([]toolcallCompatInvokeCall, 0, len(invokes))
+		for _, invokeXML := range invokes {
+			call, parsed := parseToolcallCompatInvokeXML(invokeXML)
+			if parsed {
+				calls = append(calls, call)
+			}
+		}
+		if len(calls) == 0 {
 			logrus.WithField("seed", seedForLog(idSeed)).Debug("toolcall compat: stream invoke parse failed")
 			logrus.WithField("seed", seedForLog(idSeed)).Warn("toolcall compat: failed to parse tool call from stream")
 			return emitProtocolTextAndStop(strings.TrimSpace(protocolBuffer))
 		}
 		logrus.WithFields(logrus.Fields{
 			"seed":      seedForLog(idSeed),
-			"tool_name": strings.TrimSpace(call.ToolName),
+			"tool_name": strings.TrimSpace(calls[0].ToolName),
+			"tool_calls": len(calls),
 		}).Debug("toolcall compat: stream invoke parsed")
-		return emitToolCallsAndFinish([]toolcallCompatInvokeCall{call})
+		return emitToolCallsAndFinish(calls)
 	}
 
 	const maxProtocolBufferBytes = 512 * 1024
@@ -423,17 +431,14 @@ func transformOpenAIStreamToolcallCompat(r io.Reader, emitter openAISSEEmitter, 
 						}
 					}
 
-					if triggered {
-						if len(protocolBuffer) > maxProtocolBufferBytes {
-							logrus.WithField("seed", seedForLog(idSeed)).Warn("toolcall compat: stream protocol buffer exceeded limit")
-							return emitStopAndDone()
+						if triggered {
+							if len(protocolBuffer) > maxProtocolBufferBytes {
+								logrus.WithField("seed", seedForLog(idSeed)).Warn("toolcall compat: stream protocol buffer exceeded limit")
+								return emitStopAndDone()
+							}
 						}
-						if toolcallCompatInvokeEndRE.MatchString(protocolBuffer) {
-							return finalizeFromProtocol()
-						}
+						continue
 					}
-					continue
-				}
 
 				if finishReason != "" {
 					if err := flushDetectorRemainder(); err != nil {
@@ -449,18 +454,15 @@ func transformOpenAIStreamToolcallCompat(r io.Reader, emitter openAISSEEmitter, 
 			if content != "" {
 				protocolBuffer += content
 			}
-			if len(protocolBuffer) > maxProtocolBufferBytes {
-				logrus.WithField("seed", seedForLog(idSeed)).Warn("toolcall compat: stream protocol buffer exceeded limit")
-				return emitStopAndDone()
+				if len(protocolBuffer) > maxProtocolBufferBytes {
+					logrus.WithField("seed", seedForLog(idSeed)).Warn("toolcall compat: stream protocol buffer exceeded limit")
+					return emitStopAndDone()
+				}
+				if finishReason != "" {
+					return finalizeFromProtocol()
+				}
+				continue
 			}
-			if toolcallCompatInvokeEndRE.MatchString(protocolBuffer) {
-				return finalizeFromProtocol()
-			}
-			if finishReason != "" {
-				return finalizeFromProtocol()
-			}
-			continue
-		}
 
 		if strings.HasPrefix(line, "data:") {
 			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
@@ -508,10 +510,12 @@ type toolcallCompatFunctionCallXML struct {
 }
 
 var (
-	toolcallCompatInvokeNameRE  = regexp.MustCompile(`(?is)<invoke[^>]*\bname="([^"]+)"[^>]*>`)
-	toolcallCompatParameterName = regexp.MustCompile(`(?is)<parameter[^>]*\bname="([^"]+)"[^>]*>(.*?)</parameter>`)
+	toolcallCompatInvokeNameRE  = regexp.MustCompile(`(?is)<invoke[^>]*\bname\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))[^>]*>`)
+	toolcallCompatParameterName = regexp.MustCompile(`(?is)<parameter[^>]*\bname\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))[^>]*>(.*?)</parameter>`)
 	toolcallCompatInvokeStartRE = regexp.MustCompile(`(?i)<invoke`)
 	toolcallCompatInvokeEndRE   = regexp.MustCompile(`(?i)</invoke>`)
+	toolcallCompatTrailingComma = regexp.MustCompile(`,\s*([}\]])`)
+	toolcallCompatScalarQuoted  = regexp.MustCompile(`(?i):[ \t]*"(true|false|null)"`)
 )
 
 type toolcallCompatInvokeCall struct {
@@ -545,7 +549,7 @@ func restoreToolCallsInChatCompletion(body []byte, idSeed string, triggerSignal 
 	}
 	content, _ := msg["content"].(string)
 
-	plain, call, triggered, parsed := extractToolcallCompatInvokeCall(content, triggerSignal)
+	plain, calls, triggered, parsed := extractToolcallCompatInvokeCalls(content, triggerSignal)
 	if !triggered {
 		return body, false
 	}
@@ -558,16 +562,18 @@ func restoreToolCallsInChatCompletion(body []byte, idSeed string, triggerSignal 
 
 	if parsed {
 		seed := toolcallCompatIDSeed(idSeed)
-		msg["tool_calls"] = []any{
-			map[string]any{
-				"id":   fmt.Sprintf("call_%s_%d", seed, 1),
+		toolCalls := make([]any, 0, len(calls))
+		for i, call := range calls {
+			toolCalls = append(toolCalls, map[string]any{
+				"id":   fmt.Sprintf("call_%s_%d", seed, i+1),
 				"type": "function",
 				"function": map[string]any{
 					"name":      call.ToolName,
 					"arguments": strings.TrimSpace(call.ArgsJSON),
 				},
-			},
+			})
 		}
+		msg["tool_calls"] = toolCalls
 		choice0["finish_reason"] = "tool_calls"
 	}
 
@@ -581,81 +587,75 @@ func restoreToolCallsInChatCompletion(body []byte, idSeed string, triggerSignal 
 	return converted, true
 }
 
-func extractToolcallCompatInvokeCall(content string, triggerSignal string) (string, toolcallCompatInvokeCall, bool, bool) {
+func extractToolcallCompatInvokeCalls(content string, triggerSignal string) (string, []toolcallCompatInvokeCall, bool, bool) {
 	if strings.TrimSpace(content) == "" {
-		return content, toolcallCompatInvokeCall{}, false, false
+		return content, nil, false, false
 	}
 	triggerSignal = strings.TrimSpace(triggerSignal)
 	if triggerSignal == "" {
-		return content, toolcallCompatInvokeCall{}, false, false
+		return content, nil, false, false
 	}
 
 	idx := strings.Index(content, triggerSignal)
 	if idx == -1 {
-		return content, toolcallCompatInvokeCall{}, false, false
+		return content, nil, false, false
 	}
 
 	prefix := content[:idx]
 	rest := content[idx+len(triggerSignal):]
 	plainFallback := strings.TrimSpace(prefix + rest)
 
-	locStart := toolcallCompatInvokeStartRE.FindStringIndex(rest)
-	if locStart == nil {
-		return plainFallback, toolcallCompatInvokeCall{}, true, false
-	}
-	startIdx := locStart[0]
-
-	locEnd := toolcallCompatInvokeEndRE.FindStringIndex(rest[startIdx:])
-	if locEnd == nil {
-		return plainFallback, toolcallCompatInvokeCall{}, true, false
-	}
-
-	endPos := startIdx + locEnd[1]
-	invokeXML := rest[startIdx:endPos]
-
-	parsedCall, ok := parseToolcallCompatInvokeXML(invokeXML)
+	invokes, nonInvokeText, ok := extractInvokeXMLAndPlain(rest)
 	if !ok {
-		return plainFallback, toolcallCompatInvokeCall{}, true, false
+		return plainFallback, nil, true, false
 	}
 
-	before := rest[:startIdx]
-	after := filterTrailingInvokeBlocks(rest[endPos:])
-	plain := strings.TrimSpace(prefix + before + after)
-	return plain, parsedCall, true, true
+	calls := make([]toolcallCompatInvokeCall, 0, len(invokes))
+	for _, invokeXML := range invokes {
+		call, parsed := parseToolcallCompatInvokeXML(invokeXML)
+		if parsed {
+			calls = append(calls, call)
+		}
+	}
+	if len(calls) == 0 {
+		return plainFallback, nil, true, false
+	}
+
+	plain := strings.TrimSpace(prefix + nonInvokeText)
+	return plain, calls, true, true
 }
 
 func parseToolcallCompatInvokeXML(xml string) (toolcallCompatInvokeCall, bool) {
-	m := toolcallCompatInvokeNameRE.FindStringSubmatch(xml)
-	if len(m) < 2 {
-		return toolcallCompatInvokeCall{}, false
+	toolName := ""
+	if m := toolcallCompatInvokeNameRE.FindStringSubmatch(xml); len(m) >= 4 {
+		toolName = strings.TrimSpace(firstNonEmpty(m[1], m[2], m[3]))
 	}
-	toolName := strings.TrimSpace(m[1])
+	if toolName == "" {
+		toolName = strings.TrimSpace(fuzzyExtractInvokeName(xml))
+	}
 	if toolName == "" {
 		return toolcallCompatInvokeCall{}, false
 	}
 
 	args := make(map[string]any)
-	matches := toolcallCompatParameterName.FindAllStringSubmatch(xml, -1)
-	for _, sub := range matches {
-		if len(sub) < 3 {
-			continue
+	if matches := toolcallCompatParameterName.FindAllStringSubmatch(xml, -1); len(matches) > 0 {
+		for _, sub := range matches {
+			if len(sub) < 5 {
+				continue
+			}
+			key := strings.TrimSpace(firstNonEmpty(sub[1], sub[2], sub[3]))
+			if key == "" {
+				continue
+			}
+			args[key] = parseToolcallCompatParameterValue(sub[4])
 		}
-		key := strings.TrimSpace(sub[1])
-		if key == "" {
-			continue
-		}
-		rawValue := sub[2]
-		trimmed := strings.TrimSpace(rawValue)
-		if trimmed == "" {
-			args[key] = ""
-			continue
-		}
-
-		var v any
-		if err := json.Unmarshal([]byte(trimmed), &v); err == nil {
-			args[key] = v
-		} else {
-			args[key] = trimmed
+	} else {
+		for _, p := range fuzzyExtractInvokeParameters(xml) {
+			key := strings.TrimSpace(p.name)
+			if key == "" {
+				continue
+			}
+			args[key] = parseToolcallCompatParameterValue(p.value)
 		}
 	}
 
@@ -670,23 +670,361 @@ func parseToolcallCompatInvokeXML(xml string) (toolcallCompatInvokeCall, bool) {
 	}, true
 }
 
-func filterTrailingInvokeBlocks(text string) string {
-	remaining := text
+func extractInvokeXMLAndPlain(s string) ([]string, string, bool) {
+	if strings.TrimSpace(s) == "" {
+		return nil, s, false
+	}
+
+	var (
+		invokes []string
+		plain   strings.Builder
+	)
+
+	i := 0
 	for {
-		trimmed := strings.TrimLeft(remaining, " \t\r\n")
-		if trimmed == "" {
+		locStart := toolcallCompatInvokeStartRE.FindStringIndex(s[i:])
+		if locStart == nil {
+			plain.WriteString(s[i:])
+			break
+		}
+		start := i + locStart[0]
+		plain.WriteString(s[i:start])
+
+		locEnd := toolcallCompatInvokeEndRE.FindStringIndex(s[start:])
+		if locEnd == nil {
+			if len(invokes) == 0 {
+				return nil, s, false
+			}
+			return invokes, plain.String(), true
+		}
+		end := start + locEnd[1]
+		invokes = append(invokes, s[start:end])
+		i = end
+	}
+
+	if len(invokes) == 0 {
+		return nil, s, false
+	}
+	return invokes, plain.String(), true
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func parseToolcallCompatParameterValue(raw string) any {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+
+	var v any
+	if err := json.Unmarshal([]byte(trimmed), &v); err == nil {
+		return v
+	}
+
+	if !strings.ContainsAny(trimmed, "{[") {
+		return trimmed
+	}
+
+	repaired := repairJSON(trimmed)
+	if err := json.Unmarshal([]byte(repaired), &v); err == nil {
+		return v
+	}
+
+	lastResort := sanitizeControlCharsForJSON(repaired)
+	if err := json.Unmarshal([]byte(lastResort), &v); err == nil {
+		return v
+	}
+
+	return trimmed
+}
+
+func fuzzyExtractInvokeName(xml string) string {
+	lower := strings.ToLower(xml)
+	start := strings.Index(lower, "<invoke")
+	if start == -1 {
+		return ""
+	}
+	tagEndRel := strings.Index(lower[start:], ">")
+	if tagEndRel == -1 {
+		return ""
+	}
+	openTag := xml[start : start+tagEndRel+1]
+	return parseFuzzyAttr(openTag, "name")
+}
+
+type fuzzyParam struct {
+	name  string
+	value string
+}
+
+func fuzzyExtractInvokeParameters(xml string) []fuzzyParam {
+	lower := strings.ToLower(xml)
+	out := make([]fuzzyParam, 0, 4)
+
+	i := 0
+	for {
+		start := strings.Index(lower[i:], "<parameter")
+		if start == -1 {
+			return out
+		}
+		start += i
+
+		openEndRel := strings.Index(lower[start:], ">")
+		if openEndRel == -1 {
+			return out
+		}
+		openEnd := start + openEndRel + 1
+		openTag := xml[start:openEnd]
+		name := parseFuzzyAttr(openTag, "name")
+
+		closeStartRel := strings.Index(lower[openEnd:], "</parameter>")
+		if closeStartRel == -1 {
+			return out
+		}
+		closeStart := openEnd + closeStartRel
+		value := xml[openEnd:closeStart]
+
+		out = append(out, fuzzyParam{name: name, value: value})
+		i = closeStart + len("</parameter>")
+	}
+}
+
+func parseFuzzyAttr(tagText string, attrName string) string {
+	if tagText == "" || attrName == "" {
+		return ""
+	}
+
+	lower := strings.ToLower(tagText)
+	attr := strings.ToLower(attrName)
+
+	for {
+		idx := strings.Index(lower, attr)
+		if idx == -1 {
 			return ""
 		}
-		locStart := toolcallCompatInvokeStartRE.FindStringIndex(trimmed)
-		if locStart == nil || locStart[0] != 0 {
-			return remaining
+
+		// ensure word boundary
+		if idx > 0 {
+			prev := lower[idx-1]
+			if prev != ' ' && prev != '\t' && prev != '\n' && prev != '\r' && prev != '<' {
+				lower = lower[idx+len(attr):]
+				tagText = tagText[idx+len(attr):]
+				continue
+			}
 		}
-		locEnd := toolcallCompatInvokeEndRE.FindStringIndex(trimmed)
-		if locEnd == nil {
-			return remaining
+
+		j := idx + len(attr)
+		for j < len(lower) && (lower[j] == ' ' || lower[j] == '\t' || lower[j] == '\n' || lower[j] == '\r') {
+			j++
 		}
-		remaining = trimmed[locEnd[1]:]
+		if j >= len(lower) || lower[j] != '=' {
+			lower = lower[j:]
+			tagText = tagText[j:]
+			continue
+		}
+		j++
+		for j < len(lower) && (lower[j] == ' ' || lower[j] == '\t' || lower[j] == '\n' || lower[j] == '\r') {
+			j++
+		}
+		if j >= len(lower) {
+			return ""
+		}
+
+		quote := lower[j]
+		if quote == '"' || quote == '\'' {
+			j++
+			start := j
+			for j < len(lower) && lower[j] != quote {
+				j++
+			}
+			if j <= start || j >= len(lower) {
+				return ""
+			}
+			return strings.TrimSpace(tagText[start:j])
+		}
+
+		start := j
+		for j < len(lower) {
+			c := lower[j]
+			if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '>' {
+				break
+			}
+			j++
+		}
+		if j <= start {
+			return ""
+		}
+		return strings.TrimSpace(tagText[start:j])
 	}
+}
+
+func repairJSON(s string) string {
+	fixed := strings.TrimSpace(s)
+	if fixed == "" {
+		return fixed
+	}
+
+	fixed = extractFirstJSONArrayOrObject(fixed)
+	fixed = toolcallCompatTrailingComma.ReplaceAllString(fixed, "$1")
+	fixed = escapeNewlinesInJSONString(fixed)
+	fixed = toolcallCompatScalarQuoted.ReplaceAllStringFunc(fixed, func(match string) string {
+		sub := toolcallCompatScalarQuoted.FindStringSubmatch(match)
+		if len(sub) < 2 {
+			return match
+		}
+		return strings.Replace(match, `"`+sub[1]+`"`, strings.ToLower(sub[1]), 1)
+	})
+	fixed = closeUnbalancedJSONDelimiters(fixed)
+	return fixed
+}
+
+func extractFirstJSONArrayOrObject(s string) string {
+	fixed := strings.TrimSpace(s)
+
+	objStart := strings.Index(fixed, "{")
+	objEnd := strings.LastIndex(fixed, "}")
+	objOK := objStart != -1 && objEnd != -1 && objEnd > objStart
+
+	arrStart := strings.Index(fixed, "[")
+	arrEnd := strings.LastIndex(fixed, "]")
+	arrOK := arrStart != -1 && arrEnd != -1 && arrEnd > arrStart
+
+	if objOK && (!arrOK || objStart <= arrStart) {
+		return fixed[objStart : objEnd+1]
+	}
+	if arrOK {
+		return fixed[arrStart : arrEnd+1]
+	}
+	return fixed
+}
+
+func escapeNewlinesInJSONString(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+
+	inString := false
+	escaped := false
+
+	for _, r := range s {
+		if escaped {
+			b.WriteRune(r)
+			escaped = false
+			continue
+		}
+
+		if inString && r == '\\' {
+			b.WriteRune(r)
+			escaped = true
+			continue
+		}
+
+		if r == '"' {
+			inString = !inString
+			b.WriteRune(r)
+			continue
+		}
+
+		if inString {
+			switch r {
+			case '\n':
+				b.WriteString(`\n`)
+				continue
+			case '\r':
+				b.WriteString(`\r`)
+				continue
+			}
+		}
+
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func closeUnbalancedJSONDelimiters(s string) string {
+	stack := make([]rune, 0, 16)
+	inString := false
+	escaped := false
+
+	for _, r := range s {
+		if escaped {
+			escaped = false
+			continue
+		}
+
+		if inString && r == '\\' {
+			escaped = true
+			continue
+		}
+		if r == '"' {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+
+		switch r {
+		case '{', '[':
+			stack = append(stack, r)
+		case '}':
+			if len(stack) > 0 && stack[len(stack)-1] == '{' {
+				stack = stack[:len(stack)-1]
+			}
+		case ']':
+			if len(stack) > 0 && stack[len(stack)-1] == '[' {
+				stack = stack[:len(stack)-1]
+			}
+		}
+	}
+
+	if len(stack) == 0 {
+		return s
+	}
+
+	var b strings.Builder
+	b.Grow(len(s) + len(stack))
+	b.WriteString(s)
+	for i := len(stack) - 1; i >= 0; i-- {
+		if stack[i] == '{' {
+			b.WriteRune('}')
+		} else {
+			b.WriteRune(']')
+		}
+	}
+	return b.String()
+}
+
+func sanitizeControlCharsForJSON(s string) string {
+	if s == "" {
+		return s
+	}
+
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch r {
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			if r < 0x20 {
+				b.WriteRune(' ')
+				continue
+			}
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 type toolcallCompatFunctionCall struct {
@@ -1112,4 +1450,9 @@ func extractFirstInvokeXML(protocolBuffer string) (string, bool) {
 	}
 	end := start + locEnd[1]
 	return protocolBuffer[start:end], true
+}
+
+func extractAllInvokeXML(protocolBuffer string) ([]string, bool) {
+	invokes, _, ok := extractInvokeXMLAndPlain(protocolBuffer)
+	return invokes, ok
 }
