@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"gpt-load/internal/utils"
@@ -98,12 +99,19 @@ type anthropicRequest struct {
 type anthropicContentBlock struct {
 	Type      string          `json:"type"`
 	Text      string          `json:"text,omitempty"`
+	Source    *imageSource    `json:"source,omitempty"`
 	ID        string          `json:"id,omitempty"`
 	Name      string          `json:"name,omitempty"`
 	Input     json.RawMessage `json:"input,omitempty"`
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Content   json.RawMessage `json:"content,omitempty"`
 	IsError   bool            `json:"is_error,omitempty"`
+}
+
+type imageSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
 }
 
 func convertAnthropicMessagesToOpenAI(body []byte) ([]byte, string, error) {
@@ -316,8 +324,46 @@ func buildOpenAIToolCallsFromAnthropic(blocks []anthropicContentBlock) []any {
 func buildOpenAIUserAndToolMessagesFromAnthropic(blocks []anthropicContentBlock) []any {
 	var out []any
 
-	var currentText strings.Builder
-	flushText := func() {
+	var (
+		currentText  strings.Builder
+		currentParts []any
+		useParts     bool
+	)
+
+	appendTextPart := func(text string) {
+		if text == "" {
+			return
+		}
+		if len(currentParts) > 0 {
+			if last, ok := currentParts[len(currentParts)-1].(map[string]any); ok {
+				if t, _ := last["type"].(string); t == "text" {
+					if existing, ok := last["text"].(string); ok {
+						last["text"] = existing + text
+						return
+					}
+				}
+			}
+		}
+		currentParts = append(currentParts, map[string]any{"type": "text", "text": text})
+	}
+
+	flushUser := func() {
+		if useParts {
+			if currentText.Len() > 0 {
+				appendTextPart(currentText.String())
+				currentText.Reset()
+			}
+			if len(currentParts) > 0 {
+				out = append(out, map[string]any{
+					"role":    "user",
+					"content": currentParts,
+				})
+			}
+			currentParts = nil
+			useParts = false
+			return
+		}
+
 		text := strings.TrimSpace(currentText.String())
 		if text == "" {
 			currentText.Reset()
@@ -333,9 +379,35 @@ func buildOpenAIUserAndToolMessagesFromAnthropic(blocks []anthropicContentBlock)
 	for _, block := range blocks {
 		switch block.Type {
 		case "text":
-			currentText.WriteString(block.Text)
+			if useParts {
+				appendTextPart(block.Text)
+			} else {
+				currentText.WriteString(block.Text)
+			}
+		case "image":
+			if block.Source == nil || strings.TrimSpace(block.Source.Type) != "base64" {
+				continue
+			}
+			mediaType := strings.TrimSpace(block.Source.MediaType)
+			data := strings.TrimSpace(block.Source.Data)
+			if mediaType == "" || data == "" {
+				continue
+			}
+			if !useParts {
+				if currentText.Len() > 0 {
+					appendTextPart(strings.TrimSpace(currentText.String()))
+					currentText.Reset()
+				}
+				useParts = true
+			}
+			currentParts = append(currentParts, map[string]any{
+				"type": "image_url",
+				"image_url": map[string]any{
+					"url": fmt.Sprintf("data:%s;base64,%s", mediaType, data),
+				},
+			})
 		case "tool_result":
-			flushText()
+			flushUser()
 			out = append(out, map[string]any{
 				"role":         "tool",
 				"tool_call_id": strings.TrimSpace(block.ToolUseID),
@@ -343,7 +415,7 @@ func buildOpenAIUserAndToolMessagesFromAnthropic(blocks []anthropicContentBlock)
 			})
 		}
 	}
-	flushText()
+	flushUser()
 
 	if len(out) == 0 {
 		out = append(out, map[string]any{"role": "user", "content": ""})
@@ -520,6 +592,7 @@ func convertOpenAIChatCompletionToAnthropic(body []byte, requestedModel string) 
 
 	msgObj, _ := firstChoice["message"].(map[string]any)
 	contentText := openAIContentToString(msgObj["content"])
+	reasoningText, _ := msgObj["reasoning_content"].(string)
 	toolCalls := extractOpenAIToolCalls(msgObj["tool_calls"])
 
 	blocks := make([]any, 0, 1+len(toolCalls))
@@ -539,6 +612,16 @@ func convertOpenAIChatCompletionToAnthropic(body []byte, requestedModel string) 
 				return map[string]any{}
 			}(),
 		})
+	}
+
+	reasoningText = strings.TrimSpace(reasoningText)
+	if reasoningText != "" {
+		blocks = append([]any{
+			map[string]any{
+				"type":     "thinking",
+				"thinking": reasoningText,
+			},
+		}, blocks...)
 	}
 
 	stopReason := mapOpenAIFinishReasonToAnthropic(finishReason, len(toolCalls) > 0)
@@ -652,7 +735,49 @@ func (t *anthropicCompatTransformer) streamOpenAIToAnthropic(c *gin.Context, res
 		return fmt.Errorf("streaming unsupported by writer")
 	}
 
-	if err := writeAnthropicSSE(c.Writer, "message_start", map[string]any{
+	ctx := c.Request.Context()
+	streamDone := make(chan struct{})
+	defer close(streamDone)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = resp.Body.Close()
+		case <-streamDone:
+		}
+	}()
+
+	var writeMu sync.Mutex
+	safeWriteSSE := func(event string, data any) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return writeAnthropicSSE(c.Writer, event, data)
+	}
+	safeFlush := func() {
+		writeMu.Lock()
+		flusher.Flush()
+		writeMu.Unlock()
+	}
+
+	heartbeatTicker := time.NewTicker(5 * time.Second)
+	defer heartbeatTicker.Stop()
+	go func() {
+		for {
+			select {
+			case <-heartbeatTicker.C:
+				writeMu.Lock()
+				_, _ = fmt.Fprintf(c.Writer, ": keepalive\n\n")
+				flusher.Flush()
+				writeMu.Unlock()
+			case <-ctx.Done():
+				return
+			case <-streamDone:
+				return
+			}
+		}
+	}()
+
+	if err := safeWriteSSE("message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
 			"id":            t.messageID,
@@ -670,29 +795,60 @@ func (t *anthropicCompatTransformer) streamOpenAIToAnthropic(c *gin.Context, res
 	}); err != nil {
 		return err
 	}
-	flusher.Flush()
+	safeFlush()
 
 	var (
 		nextBlockIndex        = 0
 		textBlockOpen         = false
 		textBlockIndex        = 0
+		thinkingBlockOpen     = false
+		thinkingBlockIndex    = 0
 		currentToolCallIndex  = -1
 		currentToolBlockIndex = -1
 		currentToolBlockOpen  = false
 		lastFinishReason      = ""
 		tokenModel            = strings.TrimSpace(t.tokenModel)
 		outputTokens          = 0
+		outputBuffer          strings.Builder
 	)
 
 	reader := bufio.NewReader(resp.Body)
 	var dataLines []string
+
+	closeThinkingBlock := func() error {
+		if !thinkingBlockOpen {
+			return nil
+		}
+		thinkingBlockOpen = false
+		return safeWriteSSE("content_block_stop", map[string]any{
+			"type":  "content_block_stop",
+			"index": thinkingBlockIndex,
+		})
+	}
+
+	ensureThinkingBlock := func() error {
+		if thinkingBlockOpen {
+			return nil
+		}
+		thinkingBlockIndex = nextBlockIndex
+		nextBlockIndex++
+		thinkingBlockOpen = true
+		return safeWriteSSE("content_block_start", map[string]any{
+			"type":  "content_block_start",
+			"index": thinkingBlockIndex,
+			"content_block": map[string]any{
+				"type":     "thinking",
+				"thinking": "",
+			},
+		})
+	}
 
 	closeTextBlock := func() error {
 		if !textBlockOpen {
 			return nil
 		}
 		textBlockOpen = false
-		return writeAnthropicSSE(c.Writer, "content_block_stop", map[string]any{
+		return safeWriteSSE("content_block_stop", map[string]any{
 			"type":  "content_block_stop",
 			"index": textBlockIndex,
 		})
@@ -705,7 +861,7 @@ func (t *anthropicCompatTransformer) streamOpenAIToAnthropic(c *gin.Context, res
 		textBlockIndex = nextBlockIndex
 		nextBlockIndex++
 		textBlockOpen = true
-		return writeAnthropicSSE(c.Writer, "content_block_start", map[string]any{
+		return safeWriteSSE("content_block_start", map[string]any{
 			"type":  "content_block_start",
 			"index": textBlockIndex,
 			"content_block": map[string]any{
@@ -720,7 +876,7 @@ func (t *anthropicCompatTransformer) streamOpenAIToAnthropic(c *gin.Context, res
 			return nil
 		}
 		currentToolBlockOpen = false
-		return writeAnthropicSSE(c.Writer, "content_block_stop", map[string]any{
+		return safeWriteSSE("content_block_stop", map[string]any{
 			"type":  "content_block_stop",
 			"index": currentToolBlockIndex,
 		})
@@ -743,7 +899,7 @@ func (t *anthropicCompatTransformer) streamOpenAIToAnthropic(c *gin.Context, res
 		nextBlockIndex++
 		currentToolBlockOpen = true
 
-		return writeAnthropicSSE(c.Writer, "content_block_start", map[string]any{
+		return safeWriteSSE("content_block_start", map[string]any{
 			"type":  "content_block_start",
 			"index": currentToolBlockIndex,
 			"content_block": map[string]any{
@@ -756,10 +912,19 @@ func (t *anthropicCompatTransformer) streamOpenAIToAnthropic(c *gin.Context, res
 	}
 
 	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
 				break
+			}
+			if ctx.Err() != nil {
+				return nil
 			}
 			return fmt.Errorf("read upstream stream: %w", err)
 		}
@@ -802,14 +967,42 @@ func (t *anthropicCompatTransformer) streamOpenAIToAnthropic(c *gin.Context, res
 				continue
 			}
 
+			if reasoning, ok := delta["reasoning_content"].(string); ok && reasoning != "" {
+				if err := closeToolBlock(); err != nil {
+					return err
+				}
+				if err := closeTextBlock(); err != nil {
+					return err
+				}
+				if err := ensureThinkingBlock(); err != nil {
+					return err
+				}
+				if err := safeWriteSSE("content_block_delta", map[string]any{
+					"type":  "content_block_delta",
+					"index": thinkingBlockIndex,
+					"delta": map[string]any{
+						"type":     "thinking_delta",
+						"thinking": reasoning,
+					},
+				}); err != nil {
+					return err
+				}
+				outputBuffer.WriteString(reasoning)
+				outputTokens += estimateTokens(reasoning, tokenModel)
+				safeFlush()
+			}
+
 			if content, ok := delta["content"].(string); ok && content != "" {
+				if err := closeThinkingBlock(); err != nil {
+					return err
+				}
 				if err := closeToolBlock(); err != nil {
 					return err
 				}
 				if err := ensureTextBlock(); err != nil {
 					return err
 				}
-				if err := writeAnthropicSSE(c.Writer, "content_block_delta", map[string]any{
+				if err := safeWriteSSE("content_block_delta", map[string]any{
 					"type":  "content_block_delta",
 					"index": textBlockIndex,
 					"delta": map[string]any{
@@ -819,11 +1012,15 @@ func (t *anthropicCompatTransformer) streamOpenAIToAnthropic(c *gin.Context, res
 				}); err != nil {
 					return err
 				}
+				outputBuffer.WriteString(content)
 				outputTokens += estimateTokens(content, tokenModel)
-				flusher.Flush()
+				safeFlush()
 			}
 
 			if toolCallsAny, ok := delta["tool_calls"].([]any); ok && len(toolCallsAny) > 0 {
+				if err := closeThinkingBlock(); err != nil {
+					return err
+				}
 				if err := closeTextBlock(); err != nil {
 					return err
 				}
@@ -850,7 +1047,7 @@ func (t *anthropicCompatTransformer) streamOpenAIToAnthropic(c *gin.Context, res
 					}
 
 					if argsPart != "" {
-						if err := writeAnthropicSSE(c.Writer, "content_block_delta", map[string]any{
+						if err := safeWriteSSE("content_block_delta", map[string]any{
 							"type":  "content_block_delta",
 							"index": currentToolBlockIndex,
 							"delta": map[string]any{
@@ -860,9 +1057,10 @@ func (t *anthropicCompatTransformer) streamOpenAIToAnthropic(c *gin.Context, res
 						}); err != nil {
 							return err
 						}
+						outputBuffer.WriteString(argsPart)
 						outputTokens += estimateTokens(argsPart, tokenModel)
 					}
-					flusher.Flush()
+					safeFlush()
 				}
 			}
 
@@ -877,13 +1075,20 @@ func (t *anthropicCompatTransformer) streamOpenAIToAnthropic(c *gin.Context, res
 	if err := closeTextBlock(); err != nil {
 		return err
 	}
+	if err := closeThinkingBlock(); err != nil {
+		return err
+	}
 	if err := closeToolBlock(); err != nil {
 		return err
 	}
 
 	stopReason := mapOpenAIFinishReasonToAnthropic(lastFinishReason, currentToolCallIndex >= 0)
 
-	if err := writeAnthropicSSE(c.Writer, "message_delta", map[string]any{
+	if outputBuffer.Len() > 0 {
+		outputTokens = estimateTokens(outputBuffer.String(), tokenModel)
+	}
+
+	if err := safeWriteSSE("message_delta", map[string]any{
 		"type": "message_delta",
 		"delta": map[string]any{
 			"stop_reason":   stopReason,
@@ -895,12 +1100,12 @@ func (t *anthropicCompatTransformer) streamOpenAIToAnthropic(c *gin.Context, res
 	}); err != nil {
 		return err
 	}
-	if err := writeAnthropicSSE(c.Writer, "message_stop", map[string]any{
+	if err := safeWriteSSE("message_stop", map[string]any{
 		"type": "message_stop",
 	}); err != nil {
 		return err
 	}
-	flusher.Flush()
+	safeFlush()
 	logrus.WithFields(logrus.Fields{
 		"input_tokens":  t.inputTokens,
 		"output_tokens": outputTokens,

@@ -76,7 +76,7 @@ func TestAnthropicCompatTransformer_Stream_UsageTokens(t *testing.T) {
 		"",
 	}, "\n")
 
-	expectedOutputTokens := estimateTokens("Hello ", openAIModel) + estimateTokens(`{"city":"SF"}`, openAIModel)
+	expectedOutputTokens := estimateTokens(`Hello {"city":"SF"}`, openAIModel)
 	if expectedOutputTokens <= 0 {
 		t.Fatalf("expected expectedOutputTokens > 0, got %d", expectedOutputTokens)
 	}
