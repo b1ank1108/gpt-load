@@ -185,11 +185,11 @@ func (ps *ProxyServer) HandleProxy(c *gin.Context) {
 	}
 
 	if anthropicTransformer != nil && toolcallMeta != nil {
-		transformer = newAnthropicCompatWithToolcallCompatTransformer(anthropicTransformer, toolcallMeta.IDSeed)
+		transformer = newAnthropicCompatWithToolcallCompatTransformer(anthropicTransformer, toolcallMeta.IDSeed, toolcallMeta.Trigger)
 	}
 
 	if transformer == nil && toolcallMeta != nil {
-		transformer = newToolcallCompatTransformer(toolcallMeta.IDSeed)
+		transformer = newToolcallCompatTransformer(toolcallMeta.IDSeed, toolcallMeta.Trigger)
 	}
 
 	ps.executeRequestWithRetry(c, channelHandler, originalGroup, group, requestURL, finalBodyBytes, isStream, startTime, 0, transformer)

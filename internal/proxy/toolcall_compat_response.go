@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"unicode/utf8"
 
@@ -16,11 +17,12 @@ import (
 )
 
 type toolcallCompatTransformer struct {
-	idSeed string
+	idSeed   string
+	trigger string
 }
 
-func newToolcallCompatTransformer(idSeed string) *toolcallCompatTransformer {
-	return &toolcallCompatTransformer{idSeed: idSeed}
+func newToolcallCompatTransformer(idSeed string, trigger string) *toolcallCompatTransformer {
+	return &toolcallCompatTransformer{idSeed: idSeed, trigger: trigger}
 }
 
 func (t *toolcallCompatTransformer) HandleUpstreamError(c *gin.Context, statusCode int, upstreamBody []byte) bool {
@@ -44,7 +46,7 @@ func (t *toolcallCompatTransformer) HandleSuccess(c *gin.Context, resp *http.Res
 
 	out := decompressed
 	if !isStream {
-		if converted, ok := restoreToolCallsInChatCompletion(decompressed, t.idSeed); ok {
+		if converted, ok := restoreToolCallsInChatCompletion(decompressed, t.idSeed, t.trigger); ok {
 			out = converted
 		}
 	}
@@ -117,10 +119,15 @@ func (t *toolcallCompatTransformer) streamOpenAIWithToolcallCompat(c *gin.Contex
 		return fmt.Errorf("streaming unsupported by writer")
 	}
 
-	return transformOpenAIStreamToolcallCompat(resp.Body, openAISSEEmitter{w: c.Writer, flush: flusher.Flush}, t.idSeed)
+	return transformOpenAIStreamToolcallCompat(resp.Body, openAISSEEmitter{w: c.Writer, flush: flusher.Flush}, t.idSeed, t.trigger)
 }
 
-func transformOpenAIStreamToolcallCompat(r io.Reader, emitter openAISSEEmitter, idSeed string) error {
+func transformOpenAIStreamToolcallCompat(r io.Reader, emitter openAISSEEmitter, idSeed string, triggerSignal string) error {
+	triggerSignal = strings.TrimSpace(triggerSignal)
+	if triggerSignal == "" {
+		return fmt.Errorf("toolcall compat: missing trigger signal")
+	}
+
 	reader := bufio.NewReader(r)
 	var dataLines []string
 
@@ -129,7 +136,7 @@ func transformOpenAIStreamToolcallCompat(r io.Reader, emitter openAISSEEmitter, 
 	protocolBuffer := ""
 	triggered := false
 	sawRole := false
-	detector := newToolcallCompatStreamDetector()
+	detector := newToolcallCompatTriggerDetector(triggerSignal)
 
 	writeLine := func(line string) error {
 		if _, err := io.WriteString(emitter.w, line); err != nil {
@@ -162,7 +169,7 @@ func transformOpenAIStreamToolcallCompat(r io.Reader, emitter openAISSEEmitter, 
 		}))
 	}
 
-	emitToolCallsAndFinish := func(calls []toolcallCompatFunctionCall) error {
+	emitToolCallsAndFinish := func(calls []toolcallCompatInvokeCall) error {
 		if err := flushDetectorRemainder(); err != nil {
 			return err
 		}
@@ -222,32 +229,52 @@ func transformOpenAIStreamToolcallCompat(r io.Reader, emitter openAISSEEmitter, 
 		return emitter.done()
 	}
 
-	finalizeFromProtocol := func() error {
-		calls, ok := parseToolcallCompatFunctionCalls(protocolBuffer)
-		if !ok {
-			logrus.WithField("seed", seedForLog(idSeed)).Debug("toolcall compat: stream protocol parse failed")
-			logrus.WithField("seed", seedForLog(idSeed)).Warn("toolcall compat: failed to parse tool calls from stream")
-			return emitStopAndDone()
+	emitProtocolTextAndStop := func(text string) error {
+		if err := flushDetectorRemainder(); err != nil {
+			return err
 		}
-		tools := make([]string, 0, len(calls))
-		seen := make(map[string]struct{}, len(calls))
-		for _, call := range calls {
-			name := strings.TrimSpace(call.ToolName)
-			if name == "" {
-				continue
+		if text != "" {
+			delta := map[string]any{"content": text}
+			if !sawRole {
+				delta["role"] = "assistant"
+				sawRole = true
 			}
-			if _, ok := seen[name]; ok {
-				continue
+			if err := emitter.emit(envelope.withChoice(map[string]any{
+				"index":         0,
+				"delta":         delta,
+				"finish_reason": nil,
+			})); err != nil {
+				return err
 			}
-			seen[name] = struct{}{}
-			tools = append(tools, name)
+		}
+		if err := emitter.emit(envelope.withChoice(map[string]any{
+			"index":         0,
+			"delta":         map[string]any{},
+			"finish_reason": "stop",
+		})); err != nil {
+			return err
+		}
+		return emitter.done()
+	}
+
+	finalizeFromProtocol := func() error {
+		invokeXML, ok := extractFirstInvokeXML(protocolBuffer)
+		if !ok {
+			logrus.WithField("seed", seedForLog(idSeed)).Debug("toolcall compat: stream invoke missing or incomplete")
+			logrus.WithField("seed", seedForLog(idSeed)).Warn("toolcall compat: failed to parse invoke from stream")
+			return emitProtocolTextAndStop(strings.TrimSpace(protocolBuffer))
+		}
+		call, ok := parseToolcallCompatInvokeXML(invokeXML)
+		if !ok {
+			logrus.WithField("seed", seedForLog(idSeed)).Debug("toolcall compat: stream invoke parse failed")
+			logrus.WithField("seed", seedForLog(idSeed)).Warn("toolcall compat: failed to parse tool call from stream")
+			return emitProtocolTextAndStop(strings.TrimSpace(protocolBuffer))
 		}
 		logrus.WithFields(logrus.Fields{
-			"seed":       seedForLog(idSeed),
-			"tool_count": len(calls),
-			"tools":      tools,
-		}).Debug("toolcall compat: stream protocol parsed")
-		return emitToolCallsAndFinish(calls)
+			"seed":      seedForLog(idSeed),
+			"tool_name": strings.TrimSpace(call.ToolName),
+		}).Debug("toolcall compat: stream invoke parsed")
+		return emitToolCallsAndFinish([]toolcallCompatInvokeCall{call})
 	}
 
 	const maxProtocolBufferBytes = 512 * 1024
@@ -401,7 +428,7 @@ func transformOpenAIStreamToolcallCompat(r io.Reader, emitter openAISSEEmitter, 
 							logrus.WithField("seed", seedForLog(idSeed)).Warn("toolcall compat: stream protocol buffer exceeded limit")
 							return emitStopAndDone()
 						}
-						if strings.Contains(protocolBuffer, "</function_calls>") {
+						if toolcallCompatInvokeEndRE.MatchString(protocolBuffer) {
 							return finalizeFromProtocol()
 						}
 					}
@@ -426,7 +453,7 @@ func transformOpenAIStreamToolcallCompat(r io.Reader, emitter openAISSEEmitter, 
 				logrus.WithField("seed", seedForLog(idSeed)).Warn("toolcall compat: stream protocol buffer exceeded limit")
 				return emitStopAndDone()
 			}
-			if strings.Contains(protocolBuffer, "</function_calls>") {
+			if toolcallCompatInvokeEndRE.MatchString(protocolBuffer) {
 				return finalizeFromProtocol()
 			}
 			if finishReason != "" {
@@ -480,7 +507,24 @@ type toolcallCompatFunctionCallXML struct {
 	Raw      string `xml:",chardata"`
 }
 
-func restoreToolCallsInChatCompletion(body []byte, idSeed string) ([]byte, bool) {
+var (
+	toolcallCompatInvokeNameRE  = regexp.MustCompile(`(?is)<invoke[^>]*\bname="([^"]+)"[^>]*>`)
+	toolcallCompatParameterName = regexp.MustCompile(`(?is)<parameter[^>]*\bname="([^"]+)"[^>]*>(.*?)</parameter>`)
+	toolcallCompatInvokeStartRE = regexp.MustCompile(`(?i)<invoke`)
+	toolcallCompatInvokeEndRE   = regexp.MustCompile(`(?i)</invoke>`)
+)
+
+type toolcallCompatInvokeCall struct {
+	ToolName string
+	ArgsJSON string
+}
+
+func restoreToolCallsInChatCompletion(body []byte, idSeed string, triggerSignal string) ([]byte, bool) {
+	triggerSignal = strings.TrimSpace(triggerSignal)
+	if triggerSignal == "" {
+		return body, false
+	}
+
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return body, false
@@ -501,22 +545,9 @@ func restoreToolCallsInChatCompletion(body []byte, idSeed string) ([]byte, bool)
 	}
 	content, _ := msg["content"].(string)
 
-	plain, calls, ok := extractToolcallCompatFunctionCalls(content)
-	if !ok || len(calls) == 0 {
+	plain, call, triggered, parsed := extractToolcallCompatInvokeCall(content, triggerSignal)
+	if !triggered {
 		return body, false
-	}
-
-	seed := toolcallCompatIDSeed(idSeed)
-	toolCalls := make([]any, 0, len(calls))
-	for i, call := range calls {
-		toolCalls = append(toolCalls, map[string]any{
-			"id":   fmt.Sprintf("call_%s_%d", seed, i+1),
-			"type": "function",
-			"function": map[string]any{
-				"name":      call.ToolName,
-				"arguments": strings.TrimSpace(call.ArgsJSON),
-			},
-		})
 	}
 
 	if strings.TrimSpace(plain) == "" {
@@ -524,8 +555,22 @@ func restoreToolCallsInChatCompletion(body []byte, idSeed string) ([]byte, bool)
 	} else {
 		msg["content"] = plain
 	}
-	msg["tool_calls"] = toolCalls
-	choice0["finish_reason"] = "tool_calls"
+
+	if parsed {
+		seed := toolcallCompatIDSeed(idSeed)
+		msg["tool_calls"] = []any{
+			map[string]any{
+				"id":   fmt.Sprintf("call_%s_%d", seed, 1),
+				"type": "function",
+				"function": map[string]any{
+					"name":      call.ToolName,
+					"arguments": strings.TrimSpace(call.ArgsJSON),
+				},
+			},
+		}
+		choice0["finish_reason"] = "tool_calls"
+	}
+
 	choices[0] = choice0
 	payload["choices"] = choices
 
@@ -534,6 +579,114 @@ func restoreToolCallsInChatCompletion(body []byte, idSeed string) ([]byte, bool)
 		return body, false
 	}
 	return converted, true
+}
+
+func extractToolcallCompatInvokeCall(content string, triggerSignal string) (string, toolcallCompatInvokeCall, bool, bool) {
+	if strings.TrimSpace(content) == "" {
+		return content, toolcallCompatInvokeCall{}, false, false
+	}
+	triggerSignal = strings.TrimSpace(triggerSignal)
+	if triggerSignal == "" {
+		return content, toolcallCompatInvokeCall{}, false, false
+	}
+
+	idx := strings.Index(content, triggerSignal)
+	if idx == -1 {
+		return content, toolcallCompatInvokeCall{}, false, false
+	}
+
+	prefix := content[:idx]
+	rest := content[idx+len(triggerSignal):]
+	plainFallback := strings.TrimSpace(prefix + rest)
+
+	locStart := toolcallCompatInvokeStartRE.FindStringIndex(rest)
+	if locStart == nil {
+		return plainFallback, toolcallCompatInvokeCall{}, true, false
+	}
+	startIdx := locStart[0]
+
+	locEnd := toolcallCompatInvokeEndRE.FindStringIndex(rest[startIdx:])
+	if locEnd == nil {
+		return plainFallback, toolcallCompatInvokeCall{}, true, false
+	}
+
+	endPos := startIdx + locEnd[1]
+	invokeXML := rest[startIdx:endPos]
+
+	parsedCall, ok := parseToolcallCompatInvokeXML(invokeXML)
+	if !ok {
+		return plainFallback, toolcallCompatInvokeCall{}, true, false
+	}
+
+	before := rest[:startIdx]
+	after := filterTrailingInvokeBlocks(rest[endPos:])
+	plain := strings.TrimSpace(prefix + before + after)
+	return plain, parsedCall, true, true
+}
+
+func parseToolcallCompatInvokeXML(xml string) (toolcallCompatInvokeCall, bool) {
+	m := toolcallCompatInvokeNameRE.FindStringSubmatch(xml)
+	if len(m) < 2 {
+		return toolcallCompatInvokeCall{}, false
+	}
+	toolName := strings.TrimSpace(m[1])
+	if toolName == "" {
+		return toolcallCompatInvokeCall{}, false
+	}
+
+	args := make(map[string]any)
+	matches := toolcallCompatParameterName.FindAllStringSubmatch(xml, -1)
+	for _, sub := range matches {
+		if len(sub) < 3 {
+			continue
+		}
+		key := strings.TrimSpace(sub[1])
+		if key == "" {
+			continue
+		}
+		rawValue := sub[2]
+		trimmed := strings.TrimSpace(rawValue)
+		if trimmed == "" {
+			args[key] = ""
+			continue
+		}
+
+		var v any
+		if err := json.Unmarshal([]byte(trimmed), &v); err == nil {
+			args[key] = v
+		} else {
+			args[key] = trimmed
+		}
+	}
+
+	argsJSON := "{}"
+	if b, err := json.Marshal(args); err == nil {
+		argsJSON = string(b)
+	}
+
+	return toolcallCompatInvokeCall{
+		ToolName: toolName,
+		ArgsJSON: argsJSON,
+	}, true
+}
+
+func filterTrailingInvokeBlocks(text string) string {
+	remaining := text
+	for {
+		trimmed := strings.TrimLeft(remaining, " \t\r\n")
+		if trimmed == "" {
+			return ""
+		}
+		locStart := toolcallCompatInvokeStartRE.FindStringIndex(trimmed)
+		if locStart == nil || locStart[0] != 0 {
+			return remaining
+		}
+		locEnd := toolcallCompatInvokeEndRE.FindStringIndex(trimmed)
+		if locEnd == nil {
+			return remaining
+		}
+		remaining = trimmed[locEnd[1]:]
+	}
 }
 
 type toolcallCompatFunctionCall struct {
@@ -884,4 +1037,79 @@ func seedForLog(idSeed string) string {
 		return s[:12]
 	}
 	return s
+}
+
+type toolcallCompatTriggerDetector struct {
+	buf       string
+	trigger   string
+	triggered bool
+}
+
+func newToolcallCompatTriggerDetector(triggerSignal string) *toolcallCompatTriggerDetector {
+	return &toolcallCompatTriggerDetector{trigger: triggerSignal}
+}
+
+func (d *toolcallCompatTriggerDetector) Process(delta string) (bool, string) {
+	if d.triggered || delta == "" {
+		return false, ""
+	}
+
+	d.buf += delta
+
+	if idx := strings.Index(d.buf, d.trigger); idx != -1 {
+		emitted := d.buf[:idx]
+		d.buf = d.buf[idx+len(d.trigger):]
+		d.triggered = true
+		return true, emitted
+	}
+
+	holdback := len(d.trigger) - 1
+	if holdback <= 0 {
+		emitted := d.buf
+		d.buf = ""
+		return false, emitted
+	}
+
+	if len(d.buf) <= holdback {
+		return false, ""
+	}
+
+	cut := len(d.buf) - holdback
+	for cut > 0 && !utf8.RuneStart(d.buf[cut]) {
+		cut--
+	}
+	emitted := d.buf[:cut]
+	d.buf = d.buf[cut:]
+	return false, emitted
+}
+
+func (d *toolcallCompatTriggerDetector) TakeRemainder() string {
+	rest := d.buf
+	d.buf = ""
+	return rest
+}
+
+func (d *toolcallCompatTriggerDetector) FlushRemainder() string {
+	if d.triggered {
+		return ""
+	}
+	return d.TakeRemainder()
+}
+
+func extractFirstInvokeXML(protocolBuffer string) (string, bool) {
+	if strings.TrimSpace(protocolBuffer) == "" {
+		return "", false
+	}
+	locStart := toolcallCompatInvokeStartRE.FindStringIndex(protocolBuffer)
+	if locStart == nil {
+		return "", false
+	}
+	start := locStart[0]
+
+	locEnd := toolcallCompatInvokeEndRE.FindStringIndex(protocolBuffer[start:])
+	if locEnd == nil {
+		return "", false
+	}
+	end := start + locEnd[1]
+	return protocolBuffer[start:end], true
 }

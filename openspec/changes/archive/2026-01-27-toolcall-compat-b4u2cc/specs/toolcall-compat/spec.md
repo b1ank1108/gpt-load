@@ -1,8 +1,5 @@
-# toolcall-compat Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change toolcall-compat-openai-anthropic. Update Purpose after archive.
-## Requirements
 ### Requirement: Toolcall compatibility prompt injection
 When `toolcall_compat` is enabled for an OpenAI standard group, the proxy SHALL translate OpenAI tool calling inputs into a prompt-driven protocol for upstreams without native tool calling, using a per-request trigger signal and `<invoke>` XML tool calls.
 
@@ -136,4 +133,3 @@ When `anthropic_compat` is enabled for an OpenAI group, and `toolcall_compat` is
 
 PBT Properties:
 - [INVARIANT] For any upstream output containing trigger+valid invoke, Anthropic output includes exactly one `tool_use` block with `name` equal to the invoke name and `input` equal to the parsed parameter map. → [FALSIFICATION STRATEGY] Generate random invokes with JSON-parseable/non-parseable parameter values; assert mapping and JSON parsing behavior matches b4u2cc.
-

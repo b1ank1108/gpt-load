@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -11,13 +12,11 @@ import (
 )
 
 type toolcallCompatRequestMeta struct {
-	IDSeed string
+	IDSeed  string
+	Trigger string
 }
 
-type toolcallBackref struct {
-	ToolName string
-	ArgsJSON string
-}
+type toolcallBackref struct{}
 
 func preprocessToolcallCompatChatCompletionsRequest(body []byte) ([]byte, *toolcallCompatRequestMeta, *app_errors.APIError) {
 	var payload map[string]any
@@ -57,9 +56,10 @@ func preprocessToolcallCompatChatCompletionsRequest(body []byte) ([]byte, *toolc
 	}
 
 	seed := generateToolcallCompatIDSeed()
+	trigger := generateToolcallCompatTriggerSignal()
 
 	if hasToolsOrChoice {
-		prompt, err := buildToolcallCompatSystemPrompt(payload["tools"], payload["tool_choice"])
+		prompt, err := buildToolcallCompatSystemPrompt(payload["tools"], trigger)
 		if err != nil {
 			return nil, nil, app_errors.NewAPIError(app_errors.ErrBadRequest, err.Error())
 		}
@@ -86,11 +86,11 @@ func preprocessToolcallCompatChatCompletionsRequest(body []byte) ([]byte, *toolc
 			if err != nil {
 				return nil, nil, app_errors.NewAPIError(app_errors.ErrBadRequest, err.Error())
 			}
-			for id, ref := range backrefs {
-				toolCallsByID[id] = ref
+			for id := range backrefs {
+				toolCallsByID[id] = toolcallBackref{}
 			}
 
-			appendProtocolizedToolCalls(msg, toolCalls)
+			appendProtocolizedToolCalls(msg, trigger, toolCalls)
 			delete(msg, "tool_calls")
 			continue
 		}
@@ -100,13 +100,13 @@ func preprocessToolcallCompatChatCompletionsRequest(body []byte) ([]byte, *toolc
 			if !ok || strings.TrimSpace(callID) == "" {
 				return nil, nil, app_errors.NewAPIError(app_errors.ErrBadRequest, "tool message missing tool_call_id")
 			}
-			ref, ok := toolCallsByID[callID]
+			_, ok = toolCallsByID[callID]
 			if !ok {
 				return nil, nil, app_errors.NewAPIError(app_errors.ErrBadRequest, fmt.Sprintf("tool_call_id not found: %s", callID))
 			}
-			result := stringifyContent(msg["content"])
+			result := stringifyToolResultContent(msg["content"])
 			msg["role"] = "user"
-			msg["content"] = buildToolcallCompatToolResultText(ref.ToolName, ref.ArgsJSON, result)
+			msg["content"] = buildToolcallCompatToolResultText(callID, result)
 			delete(msg, "tool_call_id")
 		}
 	}
@@ -117,7 +117,7 @@ func preprocessToolcallCompatChatCompletionsRequest(body []byte) ([]byte, *toolc
 	if err != nil {
 		return nil, nil, app_errors.NewAPIError(app_errors.ErrInternalServer, "failed to serialize request")
 	}
-	return out, &toolcallCompatRequestMeta{IDSeed: seed}, nil
+	return out, &toolcallCompatRequestMeta{IDSeed: seed, Trigger: trigger}, nil
 }
 
 type toolcallInfo struct {
@@ -161,97 +161,134 @@ func parseOpenAIToolCalls(raw any) ([]toolcallInfo, map[string]toolcallBackref, 
 			ArgsJSON: args,
 		})
 		if strings.TrimSpace(id) != "" {
-			backrefs[id] = toolcallBackref{ToolName: name, ArgsJSON: args}
+			backrefs[id] = toolcallBackref{}
 		}
 	}
 	return infos, backrefs, nil
 }
 
-func buildToolcallCompatSystemPrompt(tools any, toolChoice any) (string, error) {
+func buildToolcallCompatSystemPrompt(tools any, triggerSignal string) (string, error) {
 	toolsXML, err := convertOpenAIToolsToXML(tools)
 	if err != nil {
 		return "", err
 	}
 
-	toolChoiceHint := strings.TrimSpace(describeToolChoice(toolChoice))
-	toolChoiceBlock := ""
-	if toolChoiceHint != "" {
-		toolChoiceBlock = toolChoiceHint + "\n\n"
-	}
-
-	return fmt.Sprintf(toolcallCompatSystemPromptTemplate, toolsXML, toolChoiceBlock), nil
+	template := toolcallCompatSystemPromptTemplate
+	template = strings.ReplaceAll(template, `\b`, "\b")
+	template = strings.ReplaceAll(template, "{trigger_signal}", triggerSignal)
+	template = strings.ReplaceAll(template, "{tools_list}", toolsXML)
+	return template, nil
 }
 
-const toolcallCompatSystemPromptTemplate = `你具备调用外部工具的能力来协助解决用户的问题
-====
-可用的工具列表定义在 <tool_list> 标签中：
-<tool_list>
-%s
-</tool_list>
+const toolcallCompatSystemPromptTemplate = `
+In this environment you have access to a set of tools you can use to answer the user's question.  
 
-当你判断调用工具是解决用户问题的唯一或最佳方式时，必须严格遵循以下流程进行回复。
-1、在需要调用工具时，你的输出应当仅仅包含 <function_call> 标签及其内容，不要包含任何其他文字、解释或评论。
-2、如果需要连续调用多个工具，请为每个工具生成一个独立的 <function_call> 标签，按执行顺序排列。
+When you need to use a tool, you MUST strictly follow the format below.
 
-%s工具调用的格式如下：
-<function_call>
-{
-  "function_call": {
-    "name": "工具名称",
-    "arguments": { "参数1": "值1" }
-  }
-}
-</function_call>
+**1. Available Tools:**
+Here is the list of tools you can use. You have access ONLY to these tools and no others.
+<antml\b:tools>
+{tools_list}
+</antml\b:tools>
 
-重要约束：
-1. 必要性：仅在无法直接回答用户问题，且工具能提供必要信息或执行必要操作时才使用工具。
-2. 准确性："name" 必须精确匹配 <tool_list> 中提供的某个工具的 name；"arguments" 必须是有效的 JSON 对象，并包含该工具所需的所有参数及其准确值。
-3. 格式：如果决定调用工具，你的回复必须且只能包含一个或多个 <function_call> 标签，不允许任何前缀、后缀或解释性文本。
-4. 直接回答：如果你可以直接、完整地回答用户的问题，请不要使用工具，直接生成回答内容。
-5. 避免猜测：如果不确定信息，且有合适的工具可以获取该信息，请使用工具而不是猜测。
-6. 隐藏协议：除非正在发起工具调用，否则不要在回答中输出任何 <function_call> 标签或工具调用协议/工具列表。
+**2. Tool Call Procedure:**
+When you decide to call a tool, you MUST output EXACTLY this trigger signal: {trigger_signal}
+The trigger signal MUST be output on a completely empty line by itself before any tool calls.
+Do NOT add any other text, spaces, or characters before or after {trigger_signal} on that line.
+You may provide explanations or reasoning before outputting {trigger_signal}, but once you decide to make a tool call, {trigger_signal} must come first.
+You MUST output the trigger signal {trigger_signal} ONLY ONCE per response. Never output multiple trigger signals in a single response.
 
-工具调用结果将由外部系统在对话中插入如下格式的调用记录，你仅可理解与引用，不得伪造：
-<function_call>
-{
-  "function_call_record": {
-    "name": "工具名称",
-    "arguments": { ...JSON 参数... },
-    "response": ...工具返回结果...
-  }
-}
-</function_call>
-注意："response" 可能为结构化 JSON，也可能为普通字符串。`
+After outputting the trigger signal, immediately provide your tool calls enclosed in <invoke> XML tags.
 
-func appendProtocolizedToolCalls(message map[string]any, toolCalls []toolcallInfo) {
-	payload := buildToolcallCompatToolCallsText(toolCalls)
+**3. XML Format for Tool Calls:**
+Your tool calls must be structured EXACTLY as follows. This is the ONLY format you can use, and any deviation will result in failure.
+
+<antml\b:format>
+{trigger_signal}
+<invoke name="Write">
+<parameter name="file_path">C:\path\weather.css</parameter>
+<parameter name="content"> body {{ background-color: lightblue; }} </parameter>
+</invoke>
+</antml\b:format>
+
+IMPORTANT RULES:
+  - You may provide explanations or reasoning before deciding to call a tool.
+  - Once you decide to call a tool, you must first output the trigger signal {trigger_signal} on a separate line by itself.
+  - The trigger signal may only appear once per response and must not be repeated.
+  - Tool calls must use the exact XML format below: immediately after the trigger signal, use <invoke> and <parameter> tags.
+  - No additional text may be added after the closing </invoke> tag.
+  - Parameters must retain punctuation (including hyphen prefixes) exactly as defined.
+  - Encode arrays and objects in JSON before placing inside <parameter>.
+  - Be concise when not using tools.
+  - 在调用工具后会得到工具调用结果，所以请在一次工具调用得到结果后再调用下一个。
+  
+  `
+
+func appendProtocolizedToolCalls(message map[string]any, triggerSignal string, toolCalls []toolcallInfo) {
+	payload := buildToolcallCompatToolCallsText(triggerSignal, toolCalls)
 	appendToMessageContent(message, payload)
 }
 
-func buildToolcallCompatToolCallsText(toolCalls []toolcallInfo) string {
+func buildToolcallCompatToolCallsText(triggerSignal string, toolCalls []toolcallInfo) string {
 	var b strings.Builder
-	for _, call := range toolCalls {
-		callJSON := buildToolcallCompatFunctionCallJSON(call.ToolName, call.ArgsJSON)
-		b.WriteString("<function_call>")
-		b.WriteString(callJSON)
-		b.WriteString("</function_call>")
+	for i, call := range toolCalls {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(triggerSignal)
+		b.WriteString("\n")
+		b.WriteString(buildToolcallCompatInvokeXML(call.ToolName, call.ArgsJSON))
 	}
 	return b.String()
 }
 
-func buildToolcallCompatToolResultText(toolName string, argsJSON string, result string) string {
-	payload := map[string]any{
-		"function_call_record": map[string]any{
-			"name":      toolName,
-			"arguments": coerceJSONString(argsJSON),
-			"response":  coerceJSONString(result),
-		},
+func buildToolcallCompatInvokeXML(toolName string, argsJSON string) string {
+	argsAny := coerceJSONString(argsJSON)
+	args, _ := argsAny.(map[string]any)
+	if args == nil {
+		args = map[string]any{}
 	}
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return "<function_call>{}</function_call>"
+
+	keys := make([]string, 0, len(args))
+	for k := range args {
+		if strings.TrimSpace(k) == "" {
+			continue
+		}
+		keys = append(keys, k)
 	}
-	return "<function_call>" + string(b) + "</function_call>"
+	sort.Strings(keys)
+
+	var params strings.Builder
+	for i, k := range keys {
+		if i > 0 {
+			params.WriteString("\n")
+		}
+		params.WriteString(`<parameter name="`)
+		params.WriteString(escapeXMLAttr(k))
+		params.WriteString(`">`)
+		params.WriteString(toolcallCompatFormatParameterValue(args[k]))
+		params.WriteString(`</parameter>`)
+	}
+
+	return `<invoke name="` + escapeXMLAttr(toolName) + `">` + "\n" + params.String() + "\n</invoke>"
+}
+
+func toolcallCompatFormatParameterValue(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	encoded, err := marshalJSONNoHTMLEscape(v)
+	if err == nil {
+		return encoded
+	}
+	return stringifyContent(v)
+}
+
+func buildToolcallCompatToolResultText(toolCallID string, result string) string {
+	return `<tool_result id="` + escapeXMLAttr(toolCallID) + `">` + result + `</tool_result>`
 }
 
 func appendToMessageContent(message map[string]any, extra string) {
@@ -275,6 +312,20 @@ func stringifyContent(v any) string {
 		return string(b)
 	}
 	return fmt.Sprintf("%v", v)
+}
+
+func stringifyToolResultContent(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	encoded, err := marshalJSONNoHTMLEscape(v)
+	if err == nil {
+		return encoded
+	}
+	return stringifyContent(v)
 }
 
 func buildToolcallCompatFunctionCallJSON(toolName string, argsJSON string) string {
@@ -312,6 +363,14 @@ func generateToolcallCompatIDSeed() string {
 	return hex.EncodeToString(b[:])
 }
 
+func generateToolcallCompatTriggerSignal() string {
+	var b [3]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "<<CALL_000000>>"
+	}
+	return "<<CALL_" + hex.EncodeToString(b[:]) + ">>"
+}
+
 func describeToolChoice(toolChoice any) string {
 	if toolChoice == nil {
 		return ""
@@ -343,7 +402,7 @@ func describeToolChoice(toolChoice any) string {
 
 func convertOpenAIToolsToXML(raw any) (string, error) {
 	if raw == nil {
-		return "", nil
+		return "<function_list>None</function_list>", nil
 	}
 
 	items, ok := raw.([]any)
@@ -351,19 +410,8 @@ func convertOpenAIToolsToXML(raw any) (string, error) {
 		return "", fmt.Errorf("invalid tools format")
 	}
 
-	type paramXML struct {
-		Name        string
-		Type        string
-		Description string
-		Required    bool
-	}
-	type toolXML struct {
-		Name        string
-		Description string
-		Params      []paramXML
-	}
-
-	tools := make([]toolXML, 0, len(items))
+	var b strings.Builder
+	validTools := 0
 	for _, item := range items {
 		toolObj, ok := item.(map[string]any)
 		if !ok {
@@ -373,90 +421,156 @@ func convertOpenAIToolsToXML(raw any) (string, error) {
 		if !ok {
 			continue
 		}
+
 		name, _ := fn["name"].(string)
 		name = strings.TrimSpace(name)
 		if name == "" {
 			continue
 		}
-		desc, _ := fn["description"].(string)
 
-		var params []paramXML
+		desc, _ := fn["description"].(string)
+		desc = strings.TrimSpace(desc)
+		if desc == "" {
+			desc = "None"
+		}
+
+		required := make([]string, 0)
+		requiredSet := make(map[string]struct{})
+		props := make(map[string]any)
 		if schema, ok := fn["parameters"].(map[string]any); ok {
-			props, _ := schema["properties"].(map[string]any)
-			requiredSet := make(map[string]struct{})
+			if propsAny, ok := schema["properties"].(map[string]any); ok && propsAny != nil {
+				props = propsAny
+			}
 			if reqAny, ok := schema["required"].([]any); ok {
 				for _, r := range reqAny {
-					if s, ok := r.(string); ok && strings.TrimSpace(s) != "" {
-						requiredSet[strings.TrimSpace(s)] = struct{}{}
+					s, ok := r.(string)
+					s = strings.TrimSpace(s)
+					if !ok || s == "" {
+						continue
 					}
+					required = append(required, s)
+					requiredSet[s] = struct{}{}
 				}
 			}
+		}
 
-			paramNames := make([]string, 0, len(props))
-			for k := range props {
-				paramNames = append(paramNames, k)
+		paramNames := make([]string, 0, len(props))
+		for k := range props {
+			if strings.TrimSpace(k) == "" {
+				continue
 			}
-			sort.Strings(paramNames)
+			paramNames = append(paramNames, k)
+		}
+		sort.Strings(paramNames)
 
+		parametersXML := ""
+		if len(paramNames) > 0 {
+			var pb strings.Builder
 			for _, paramName := range paramNames {
 				propAny := props[paramName]
-				prop, _ := propAny.(map[string]any)
-				pType, _ := prop["type"].(string)
-				pDesc, _ := prop["description"].(string)
+				paramInfo, _ := propAny.(map[string]any)
+				pType, _ := paramInfo["type"].(string)
+				pType = strings.TrimSpace(pType)
+				if pType == "" {
+					pType = "any"
+				}
+				pDesc, _ := paramInfo["description"].(string)
+				pDesc = strings.TrimSpace(pDesc)
+
+				enumAny := paramInfo["enum"]
+				enumJSON := ""
+				if enumAny != nil {
+					if encoded, err := marshalJSONNoHTMLEscape(enumAny); err == nil {
+						enumJSON = encoded
+					}
+				}
+
 				_, req := requiredSet[paramName]
-				params = append(params, paramXML{
-					Name:        paramName,
-					Type:        strings.TrimSpace(pType),
-					Description: strings.TrimSpace(pDesc),
-					Required:    req,
-				})
+
+				lines := []string{
+					`    <parameter name="` + escapeXMLAttr(paramName) + `">`,
+					`      <type>` + pType + `</type>`,
+					`      <required>` + fmt.Sprintf("%t", req) + `</required>`,
+				}
+				if pDesc != "" {
+					lines = append(lines, `      <description>`+escapeToolcallCompatText(pDesc)+`</description>`)
+				}
+				if enumJSON != "" {
+					lines = append(lines, `      <enum>`+escapeToolcallCompatText(enumJSON)+`</enum>`)
+				}
+				lines = append(lines, "    </parameter>")
+				if pb.Len() > 0 {
+					pb.WriteString("\n")
+				}
+				pb.WriteString(strings.Join(lines, "\n"))
 			}
+			parametersXML = pb.String()
 		}
 
-		tools = append(tools, toolXML{
-			Name:        name,
-			Description: strings.TrimSpace(desc),
-			Params:      params,
-		})
-	}
-
-	var b strings.Builder
-	for i, tool := range tools {
-		b.WriteString(`<tool name="`)
-		b.WriteString(escapeXMLAttr(tool.Name))
-		b.WriteString(`"`)
-		if tool.Description != "" {
-			b.WriteString(` description="`)
-			b.WriteString(escapeXMLAttr(tool.Description))
-			b.WriteString(`"`)
+		requiredXML := "    <param>None</param>"
+		if len(required) > 0 {
+			var rb strings.Builder
+			for i, r := range required {
+				if i > 0 {
+					rb.WriteString("\n")
+				}
+				rb.WriteString("    <param>")
+				rb.WriteString(r)
+				rb.WriteString("</param>")
+			}
+			requiredXML = rb.String()
 		}
-		b.WriteString(">\n")
 
-		for _, p := range tool.Params {
-			b.WriteString(`    <parameter name="`)
-			b.WriteString(escapeXMLAttr(p.Name))
-			b.WriteString(`"`)
-			if p.Required {
-				b.WriteString(` required="true"`)
-			}
-			if p.Description != "" {
-				b.WriteString(` description="`)
-				b.WriteString(escapeXMLAttr(p.Description))
-				b.WriteString(`"`)
-			}
-			if p.Type != "" {
-				b.WriteString(` type="`)
-				b.WriteString(escapeXMLAttr(p.Type))
-				b.WriteString(`"`)
-			}
-			b.WriteString("></parameter>\n")
-		}
-		b.WriteString("</tool>\n")
-		if i != len(tools)-1 {
+		if validTools == 0 {
+			b.WriteString("<function_list>\n")
+		} else {
 			b.WriteString("\n")
 		}
+
+		validTools++
+		b.WriteString(fmt.Sprintf(`  <tool id="%d">`, validTools))
+		b.WriteString("\n")
+		b.WriteString("    <name>")
+		b.WriteString(name)
+		b.WriteString("</name>\n")
+		b.WriteString("    <description>")
+		b.WriteString(escapeToolcallCompatText(desc))
+		b.WriteString("</description>\n")
+		b.WriteString("    <required>\n")
+		b.WriteString(requiredXML)
+		b.WriteString("\n")
+		b.WriteString("    </required>\n")
+		if parametersXML == "" {
+			b.WriteString("    <parameters>None</parameters>\n")
+		} else {
+			b.WriteString("    <parameters>\n")
+			b.WriteString(parametersXML)
+			b.WriteString("\n")
+			b.WriteString("    </parameters>\n")
+		}
+		b.WriteString("  </tool>")
 	}
-	return strings.TrimRight(b.String(), "\n"), nil
+
+	if validTools == 0 {
+		return "<function_list>None</function_list>", nil
+	}
+
+	b.WriteString("\n</function_list>")
+	return b.String(), nil
+}
+
+func escapeToolcallCompatText(text string) string {
+	return strings.NewReplacer("<", "&lt;", ">", "&gt;").Replace(text)
+}
+
+func marshalJSONNoHTMLEscape(v any) (string, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(buf.String(), "\n"), nil
 }
 
 func escapeXMLAttr(s string) string {

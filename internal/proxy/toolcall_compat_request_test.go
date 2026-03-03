@@ -3,9 +3,12 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"regexp"
 	"strings"
 	"testing"
 )
+
+var toolcallCompatTriggerRE = regexp.MustCompile(`^<<CALL_[0-9a-f]{6}>>$`)
 
 func TestPreprocessToolcallCompatChatCompletionsRequest_PassthroughWhenNoSignals(t *testing.T) {
 	in := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
@@ -26,7 +29,11 @@ func TestPreprocessToolcallCompatChatCompletionsRequest_ToolsInjectedAndRemoved(
 	in := []byte(`{
 		"model": "gpt-4.1-mini",
 		"messages": [{"role":"user","content":"Hello"}],
-		"tools": [{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],
+		"tools": [{"type":"function","function":{
+			"name":"get_weather",
+			"description":"Get <weather> by city",
+			"parameters":{"type":"object","properties":{"city":{"type":"string","enum":["<SF>","NY"]}},"required":["city"]}
+		}}],
 		"tool_choice": {"type":"function","function":{"name":"get_weather"}}
 	}`)
 
@@ -36,6 +43,9 @@ func TestPreprocessToolcallCompatChatCompletionsRequest_ToolsInjectedAndRemoved(
 	}
 	if meta == nil || strings.TrimSpace(meta.IDSeed) == "" {
 		t.Fatalf("unexpected meta: %#v", meta)
+	}
+	if !toolcallCompatTriggerRE.MatchString(meta.Trigger) {
+		t.Fatalf("unexpected trigger: %q", meta.Trigger)
 	}
 
 	var m map[string]any
@@ -58,17 +68,32 @@ func TestPreprocessToolcallCompatChatCompletionsRequest_ToolsInjectedAndRemoved(
 		t.Fatalf("expected system role, got %#v", sys["role"])
 	}
 	sysContent, _ := sys["content"].(string)
-	if !strings.Contains(sysContent, "<tool_list>") || !strings.Contains(sysContent, "</tool_list>") {
-		t.Fatalf("system prompt missing tool_list")
+	if !strings.Contains(sysContent, "<function_list>") || !strings.Contains(sysContent, "</function_list>") {
+		t.Fatalf("system prompt missing function_list")
 	}
-	if !strings.Contains(sysContent, `name="get_weather"`) {
+	if !strings.Contains(sysContent, "<antml\b:tools>") || !strings.Contains(sysContent, "</antml\b:tools>") {
+		t.Fatalf("system prompt missing antml tools block")
+	}
+	if !strings.Contains(sysContent, "<antml\b:format>") || !strings.Contains(sysContent, "</antml\b:format>") {
+		t.Fatalf("system prompt missing antml format block")
+	}
+	if !strings.Contains(sysContent, "\n"+meta.Trigger+"\n<invoke name=\"Write\">") {
+		t.Fatalf("system prompt missing trigger format example")
+	}
+	if !strings.Contains(sysContent, "<name>get_weather</name>") {
 		t.Fatalf("system prompt missing tool name")
 	}
-	if !strings.Contains(sysContent, "<function_call>") || !strings.Contains(sysContent, `"function_call"`) {
-		t.Fatalf("system prompt missing function_call format")
+	if !strings.Contains(sysContent, "Get &lt;weather&gt; by city") {
+		t.Fatalf("system prompt missing escaped tool description")
 	}
-	if !strings.Contains(sysContent, "必须调用工具") {
-		t.Fatalf("system prompt missing tool_choice hint")
+	if !strings.Contains(sysContent, `["&lt;SF&gt;","NY"]`) {
+		t.Fatalf("system prompt missing escaped enum JSON")
+	}
+	if strings.Contains(sysContent, "<tool_list>") || strings.Contains(sysContent, "<function_call>") {
+		t.Fatalf("system prompt contains legacy protocol")
+	}
+	if strings.Contains(sysContent, "工具选择策略已指定") || strings.Contains(sysContent, "必须调用工具") {
+		t.Fatalf("system prompt contains tool_choice semantics")
 	}
 	user := msgs[1].(map[string]any)
 	if user["role"] != "user" || user["content"] != "Hello" {
@@ -92,6 +117,9 @@ func TestPreprocessToolcallCompatChatCompletionsRequest_AssistantToolCallsProtoc
 	if meta == nil {
 		t.Fatalf("expected meta")
 	}
+	if !toolcallCompatTriggerRE.MatchString(meta.Trigger) {
+		t.Fatalf("unexpected trigger: %q", meta.Trigger)
+	}
 
 	var m map[string]any
 	if err := json.Unmarshal(out, &m); err != nil {
@@ -105,10 +133,13 @@ func TestPreprocessToolcallCompatChatCompletionsRequest_AssistantToolCallsProtoc
 	}
 	content, _ := asst["content"].(string)
 	if !strings.Contains(content, "Calling tool") ||
-		!strings.Contains(content, "<function_call>") ||
-		!strings.Contains(content, `"name":"get_weather"`) ||
-		!strings.Contains(content, `"city":"SF"`) {
+		!strings.Contains(content, meta.Trigger) ||
+		!strings.Contains(content, `<invoke name="get_weather">`) ||
+		!strings.Contains(content, `<parameter name="city">SF</parameter>`) {
 		t.Fatalf("unexpected assistant content: %q", content)
+	}
+	if strings.Contains(content, "<function_call>") {
+		t.Fatalf("unexpected legacy protocol in assistant content: %q", content)
 	}
 }
 
@@ -154,11 +185,7 @@ func TestPreprocessToolcallCompatChatCompletionsRequest_ToolMessageBackrefConver
 		t.Fatalf("expected tool_call_id removed")
 	}
 	content, _ := toolMsg["content"].(string)
-	if !strings.Contains(content, "<function_call>") ||
-		!strings.Contains(content, `"function_call_record"`) ||
-		!strings.Contains(content, `"name":"get_weather"`) ||
-		!strings.Contains(content, `"city":"SF"`) ||
-		!strings.Contains(content, `"response":"Sunny"`) {
+	if content != `<tool_result id="call1">Sunny</tool_result>` {
 		t.Fatalf("unexpected converted tool content: %q", content)
 	}
 }

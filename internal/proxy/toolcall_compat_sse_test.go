@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 
 func TestTransformOpenAIStreamToolcallCompat_EmitsToolCalls(t *testing.T) {
 	idSeed := "0123456789abcdef"
+	trigger := "<<CALL_aa11bb>>"
 	upstream := strings.Join([]string{
 		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello "},"finish_reason":null}]}`,
 		"",
@@ -21,18 +23,24 @@ func TestTransformOpenAIStreamToolcallCompat_EmitsToolCalls(t *testing.T) {
 		"",
 		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"<think>ignored</think>\\n"},"finish_reason":null}]}`,
 		"",
-		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"\\n<function_call>{\"function_call\":{\"name\":\"get_weather\",\"arguments\":{\"city\":\"SF\"}}}</function_call>"},"finish_reason":null}]}`,
+		fmt.Sprintf(`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"\\n%s\\n<invoke name=\"get_weather\">\\n<parameter name=\"city\">SF</parameter>\\n</invoke>"},"finish_reason":null}]}`, trigger),
 		"",
 		`data: [DONE]`,
 		"",
 	}, "\n")
 
 	var out bytes.Buffer
-	if err := transformOpenAIStreamToolcallCompat(strings.NewReader(upstream), openAISSEEmitter{w: &out}, idSeed); err != nil {
+	if err := transformOpenAIStreamToolcallCompat(strings.NewReader(upstream), openAISSEEmitter{w: &out}, idSeed, trigger); err != nil {
 		t.Fatalf("transformOpenAIStreamToolcallCompat error: %v", err)
 	}
 
 	s := out.String()
+	if strings.Contains(s, "CALL_aa11bb") {
+		t.Fatalf("expected trigger not to leak to client: %q", s)
+	}
+	if strings.Contains(strings.ToLower(s), "<invoke") || strings.Contains(strings.ToLower(s), "\\u003cinvoke") {
+		t.Fatalf("expected invoke tags not to leak to client: %q", s)
+	}
 	if strings.Contains(s, "<function_calls>") || strings.Contains(s, "<function_call>") {
 		t.Fatalf("expected protocol block not to leak to client: %q", s)
 	}
@@ -53,12 +61,51 @@ func TestTransformOpenAIStreamToolcallCompat_EmitsToolCalls(t *testing.T) {
 	}
 }
 
+func TestTransformOpenAIStreamToolcallCompat_ParseFailure_FallsBackToText(t *testing.T) {
+	idSeed := "compat"
+	trigger := "<<CALL_aa11bb>>"
+	upstream := strings.Join([]string{
+		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello\\n\\n"},"finish_reason":null}]}`,
+		"",
+		fmt.Sprintf(`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"%s\\n<invoke name=\"get_weather\">\\n<parameter name=\"city\">{\\\"bad\\\":</parameter>\\n"},"finish_reason":null}]}`, trigger),
+		"",
+		`data: [DONE]`,
+		"",
+	}, "\n")
+
+	var out bytes.Buffer
+	if err := transformOpenAIStreamToolcallCompat(strings.NewReader(upstream), openAISSEEmitter{w: &out}, idSeed, trigger); err != nil {
+		t.Fatalf("transformOpenAIStreamToolcallCompat error: %v", err)
+	}
+
+	s := out.String()
+	if strings.Contains(s, "CALL_aa11bb") {
+		t.Fatalf("expected trigger not to leak to client: %q", s)
+	}
+	if strings.Contains(s, `"tool_calls"`) || strings.Contains(s, `"finish_reason":"tool_calls"`) {
+		t.Fatalf("expected no tool_calls emissions on parse failure: %q", s)
+	}
+	if !strings.Contains(s, "Hello") {
+		t.Fatalf("expected pre-trigger text preserved: %q", s)
+	}
+	if !strings.Contains(strings.ToLower(s), "\\u003cinvoke") {
+		t.Fatalf("expected invoke to fall back as text on parse failure: %q", s)
+	}
+	if !strings.Contains(s, `"finish_reason":"stop"`) {
+		t.Fatalf("expected finish_reason=stop on parse failure: %q", s)
+	}
+	if !strings.Contains(s, "data: [DONE]") {
+		t.Fatalf("expected [DONE] terminator: %q", s)
+	}
+}
+
 func TestAnthropicCompatWithToolcallCompatTransformer_Stream_EmitsToolUse(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	idSeed := "0123456789abcdef"
+	trigger := "<<CALL_deadbe>>"
 	upstream := strings.Join([]string{
-		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"\\n<function_call>{\"function_call\":{\"name\":\"get_weather\",\"arguments\":{\"city\":\"SF\"}}}</function_call>"},"finish_reason":null}]}`,
+		fmt.Sprintf(`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"\\n%s\\n<invoke name=\"get_weather\">\\n<parameter name=\"city\">SF</parameter>\\n</invoke>"},"finish_reason":null}]}`, trigger),
 		"",
 		`data: [DONE]`,
 		"",
@@ -68,7 +115,7 @@ func TestAnthropicCompatWithToolcallCompatTransformer_Stream_EmitsToolUse(t *tes
 	router := gin.New()
 	router.GET("/sse", func(c *gin.Context) {
 		base := newAnthropicCompatTransformer("claude-test")
-		transformer := newAnthropicCompatWithToolcallCompatTransformer(base, idSeed)
+		transformer := newAnthropicCompatWithToolcallCompatTransformer(base, idSeed, trigger)
 		resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(upstream))}
 		errCh <- transformer.HandleSuccess(c, resp, true)
 	})
@@ -91,6 +138,12 @@ func TestAnthropicCompatWithToolcallCompatTransformer_Stream_EmitsToolUse(t *tes
 	}
 
 	body := string(bodyBytes)
+	if strings.Contains(body, "CALL_deadbe") {
+		t.Fatalf("expected trigger not to leak: %q", body)
+	}
+	if strings.Contains(strings.ToLower(body), "<invoke") || strings.Contains(strings.ToLower(body), "\\u003cinvoke") {
+		t.Fatalf("expected invoke tags not to leak: %q", body)
+	}
 	if !strings.Contains(body, `"type":"tool_use"`) || !strings.Contains(body, `"name":"get_weather"`) {
 		t.Fatalf("expected tool_use in anthropic sse: %q", body)
 	}
@@ -100,10 +153,11 @@ func TestAnthropicCompatWithToolcallCompatTransformer_NonStream_EmitsToolUse(t *
 	gin.SetMode(gin.TestMode)
 
 	idSeed := "0123456789abcdef"
+	trigger := "<<CALL_deadbe>>"
 	upstream := `{
 		"id":"chatcmpl_1",
 		"model":"m",
-		"choices":[{"index":0,"message":{"role":"assistant","content":"Hello\n\n<function_call>{\"function_call\":{\"name\":\"get_weather\",\"arguments\":{\"city\":\"SF\"}}}</function_call>"},"finish_reason":"stop"}],
+		"choices":[{"index":0,"message":{"role":"assistant","content":"Hello\n\n<<CALL_deadbe>>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">SF</parameter>\n</invoke>"},"finish_reason":"stop"}],
 		"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}
 	}`
 
@@ -111,7 +165,7 @@ func TestAnthropicCompatWithToolcallCompatTransformer_NonStream_EmitsToolUse(t *
 	router := gin.New()
 	router.GET("/json", func(c *gin.Context) {
 		base := newAnthropicCompatTransformer("claude-test")
-		transformer := newAnthropicCompatWithToolcallCompatTransformer(base, idSeed)
+		transformer := newAnthropicCompatWithToolcallCompatTransformer(base, idSeed, trigger)
 		resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(upstream))}
 		errCh <- transformer.HandleSuccess(c, resp, false)
 	})
@@ -134,8 +188,11 @@ func TestAnthropicCompatWithToolcallCompatTransformer_NonStream_EmitsToolUse(t *
 	}
 
 	body := string(bodyBytes)
-	if strings.Contains(body, "<function_calls>") || strings.Contains(body, "<function_call>") {
-		t.Fatalf("expected protocol block not to leak to client: %q", body)
+	if strings.Contains(body, "CALL_deadbe") {
+		t.Fatalf("expected trigger not to leak to client: %q", body)
+	}
+	if strings.Contains(strings.ToLower(body), "<invoke") || strings.Contains(strings.ToLower(body), "\\u003cinvoke") {
+		t.Fatalf("expected invoke tags not to leak to client: %q", body)
 	}
 
 	var payload map[string]any
@@ -178,8 +235,206 @@ func TestAnthropicCompatWithToolcallCompatTransformer_NonStream_EmitsToolUse(t *
 	}
 }
 
+func TestAnthropicCompatWithToolcallCompatTransformer_Stream_ParseFailure_FallsBackToText(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	idSeed := "0123456789abcdef"
+	trigger := "<<CALL_deadbe>>"
+	upstream := strings.Join([]string{
+		fmt.Sprintf(`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"%s\\n<invoke name=\"get_weather\">\\n<parameter name=\"city\">{\\\"bad\\\":</parameter>\\n"},"finish_reason":null}]}`, trigger),
+		"",
+		`data: [DONE]`,
+		"",
+	}, "\n")
+
+	errCh := make(chan error, 1)
+	router := gin.New()
+	router.GET("/sse", func(c *gin.Context) {
+		base := newAnthropicCompatTransformer("claude-test")
+		transformer := newAnthropicCompatWithToolcallCompatTransformer(base, idSeed, trigger)
+		resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(upstream))}
+		errCh <- transformer.HandleSuccess(c, resp, true)
+	})
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/sse")
+	if err != nil {
+		t.Fatalf("http get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if transformerErr := <-errCh; transformerErr != nil {
+		t.Fatalf("transformer error: %v", transformerErr)
+	}
+
+	body := string(bodyBytes)
+	if strings.Contains(body, `"type":"tool_use"`) {
+		t.Fatalf("expected no tool_use blocks on parse failure: %q", body)
+	}
+	if strings.Contains(body, "CALL_deadbe") {
+		t.Fatalf("expected trigger to be stripped on parse failure: %q", body)
+	}
+	if !strings.Contains(strings.ToLower(body), "\\u003cinvoke") {
+		t.Fatalf("expected invoke to fall back as text on parse failure: %q", body)
+	}
+}
+
+func TestAnthropicCompatWithToolcallCompatTransformer_NonStream_ParseFailure_FallsBackToText(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	idSeed := "0123456789abcdef"
+	trigger := "<<CALL_deadbe>>"
+	upstream := fmt.Sprintf(`{
+		"id":"chatcmpl_1",
+		"model":"m",
+		"choices":[{"index":0,"message":{"role":"assistant","content":"%s\n<invoke name=\"get_weather\">\n<parameter name=\"city\">{\"bad\":</parameter>\n"},"finish_reason":"stop"}],
+		"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}
+	}`, trigger)
+
+	errCh := make(chan error, 1)
+	router := gin.New()
+	router.GET("/json", func(c *gin.Context) {
+		base := newAnthropicCompatTransformer("claude-test")
+		transformer := newAnthropicCompatWithToolcallCompatTransformer(base, idSeed, trigger)
+		resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(upstream))}
+		errCh <- transformer.HandleSuccess(c, resp, false)
+	})
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/json")
+	if err != nil {
+		t.Fatalf("http get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if transformerErr := <-errCh; transformerErr != nil {
+		t.Fatalf("transformer error: %v", transformerErr)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(bodyBytes, &payload); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+
+	content, ok := payload["content"].([]any)
+	if !ok || len(content) != 1 {
+		t.Fatalf("expected single text content block: %#v", payload["content"])
+	}
+	block, ok := content[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected content block map: %#v", content[0])
+	}
+	if block["type"] != "text" {
+		t.Fatalf("expected text content block: %#v", block)
+	}
+	txt, _ := block["text"].(string)
+	if strings.Contains(txt, "CALL_deadbe") {
+		t.Fatalf("expected trigger to be stripped on parse failure: %q", txt)
+	}
+	if !strings.Contains(txt, "<invoke") {
+		t.Fatalf("expected invoke to fall back as text on parse failure: %q", txt)
+	}
+}
+
+func TestAnthropicCompatWithToolcallCompatTransformer_Stream_UTF8SafeHoldback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	idSeed := "compat"
+	trigger := "<<CALL_deadbe>>"
+	upstream := strings.Join([]string{
+		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"中aaaaaaaaa"},"finish_reason":null}]}`,
+		"",
+		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"bbbbbbbbbbb"},"finish_reason":null}]}`,
+		"",
+		`data: [DONE]`,
+		"",
+	}, "\n")
+
+	errCh := make(chan error, 1)
+	router := gin.New()
+	router.GET("/sse", func(c *gin.Context) {
+		base := newAnthropicCompatTransformer("claude-test")
+		transformer := newAnthropicCompatWithToolcallCompatTransformer(base, idSeed, trigger)
+		resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(upstream))}
+		errCh <- transformer.HandleSuccess(c, resp, true)
+	})
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/sse")
+	if err != nil {
+		t.Fatalf("http get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if transformerErr := <-errCh; transformerErr != nil {
+		t.Fatalf("transformer error: %v", transformerErr)
+	}
+
+	body := string(bodyBytes)
+	var outText strings.Builder
+	for _, block := range strings.Split(body, "\n\n") {
+		block = strings.TrimSpace(block)
+		if block == "" {
+			continue
+		}
+
+		var dataLine string
+		for _, line := range strings.Split(block, "\n") {
+			if strings.HasPrefix(line, "data: ") {
+				dataLine = strings.TrimPrefix(line, "data: ")
+				break
+			}
+		}
+		if strings.TrimSpace(dataLine) == "" {
+			continue
+		}
+
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(dataLine), &payload); err != nil {
+			continue
+		}
+		delta, _ := payload["delta"].(map[string]any)
+		if delta == nil {
+			continue
+		}
+		if deltaType, _ := delta["type"].(string); deltaType != "text_delta" {
+			continue
+		}
+		txt, _ := delta["text"].(string)
+		outText.WriteString(txt)
+	}
+
+	got := outText.String()
+	want := "中aaaaaaaaabbbbbbbbbbb"
+	if got != want {
+		t.Fatalf("unexpected text delta output: %q", got)
+	}
+	if strings.Contains(got, "�") || strings.Contains(strings.ToLower(got), "\\ufffd") {
+		t.Fatalf("expected no replacement characters: %q", got)
+	}
+}
+
 func TestTransformOpenAIStreamToolcallCompat_UTF8SafeHoldback(t *testing.T) {
 	idSeed := "compat"
+	trigger := "<<CALL_aa11bb>>"
 	upstream := strings.Join([]string{
 		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"中aaaaaaaaaaaaaa"},"finish_reason":null}]}`,
 		"",
@@ -188,7 +443,7 @@ func TestTransformOpenAIStreamToolcallCompat_UTF8SafeHoldback(t *testing.T) {
 	}, "\n")
 
 	var out bytes.Buffer
-	if err := transformOpenAIStreamToolcallCompat(strings.NewReader(upstream), openAISSEEmitter{w: &out}, idSeed); err != nil {
+	if err := transformOpenAIStreamToolcallCompat(strings.NewReader(upstream), openAISSEEmitter{w: &out}, idSeed, trigger); err != nil {
 		t.Fatalf("transformOpenAIStreamToolcallCompat error: %v", err)
 	}
 

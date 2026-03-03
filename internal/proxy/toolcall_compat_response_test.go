@@ -3,13 +3,18 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
 func TestRestoreToolCallsInChatCompletion_Success(t *testing.T) {
 	idSeed := "0123456789abcdef"
+	trigger := "<<CALL_aa11bb>>"
 	content := "Hello\n\n" +
-		"<function_call>{\"function_call\":{\"name\":\"get_weather\",\"arguments\":{\"city\":\"SF\"}}}</function_call>"
+		trigger + "\n" +
+		"<invoke name=\"get_weather\">\n" +
+		"<parameter name=\"city\">\"SF\"</parameter>\n" +
+		"</invoke>\n"
 
 	in, err := json.Marshal(map[string]any{
 		"id": "chatcmpl_1",
@@ -28,7 +33,7 @@ func TestRestoreToolCallsInChatCompletion_Success(t *testing.T) {
 		t.Fatalf("marshal input: %v", err)
 	}
 
-	out, ok := restoreToolCallsInChatCompletion(in, idSeed)
+	out, ok := restoreToolCallsInChatCompletion(in, idSeed, trigger)
 	if !ok {
 		t.Fatalf("expected restore ok")
 	}
@@ -63,6 +68,7 @@ func TestRestoreToolCallsInChatCompletion_Success(t *testing.T) {
 }
 
 func TestRestoreToolCallsInChatCompletion_PassthroughWhenNoTrigger(t *testing.T) {
+	trigger := "<<CALL_aa11bb>>"
 	in, err := json.Marshal(map[string]any{
 		"choices": []any{
 			map[string]any{
@@ -79,7 +85,7 @@ func TestRestoreToolCallsInChatCompletion_PassthroughWhenNoTrigger(t *testing.T)
 		t.Fatalf("marshal input: %v", err)
 	}
 
-	out, ok := restoreToolCallsInChatCompletion(in, "compat")
+	out, ok := restoreToolCallsInChatCompletion(in, "compat", trigger)
 	if ok {
 		t.Fatalf("expected restore not ok")
 	}
@@ -88,9 +94,12 @@ func TestRestoreToolCallsInChatCompletion_PassthroughWhenNoTrigger(t *testing.T)
 	}
 }
 
-func TestRestoreToolCallsInChatCompletion_PassthroughWhenMalformedXML(t *testing.T) {
+func TestRestoreToolCallsInChatCompletion_ParseFailure_StripsTrigger(t *testing.T) {
 	idSeed := "compat"
-	content := "Hello\n<function_call><tool>get_weather</tool>"
+	trigger := "<<CALL_aa11bb>>"
+	content := "Hello\n\n" + trigger + "\n" +
+		"<invoke name=\"get_weather\">\n" +
+		"<parameter name=\"city\">{\"bad\":</parameter>\n"
 
 	in, err := json.Marshal(map[string]any{
 		"choices": []any{
@@ -108,20 +117,30 @@ func TestRestoreToolCallsInChatCompletion_PassthroughWhenMalformedXML(t *testing
 		t.Fatalf("marshal input: %v", err)
 	}
 
-	out, ok := restoreToolCallsInChatCompletion(in, idSeed)
-	if ok {
-		t.Fatalf("expected restore not ok")
+	out, ok := restoreToolCallsInChatCompletion(in, idSeed, trigger)
+	if !ok {
+		t.Fatalf("expected restore ok")
 	}
-	if !bytes.Equal(out, in) {
-		t.Fatalf("expected passthrough body")
+
+	var payload map[string]any
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatalf("unmarshal output: %v", err)
 	}
-}
 
-func TestExtractToolcallCompatFunctionCalls_EmptyToolName(t *testing.T) {
-	content := "<function_call>{\"function_call\":{\"name\":\" \",\"arguments\":{}}}</function_call>"
+	choice0 := payload["choices"].([]any)[0].(map[string]any)
+	if choice0["finish_reason"] != "stop" {
+		t.Fatalf("unexpected finish_reason: %#v", choice0["finish_reason"])
+	}
 
-	_, calls, ok := extractToolcallCompatFunctionCalls(content)
-	if ok || calls != nil {
-		t.Fatalf("expected extract not ok, got ok=%v calls=%#v", ok, calls)
+	msg := choice0["message"].(map[string]any)
+	contentOut, _ := msg["content"].(string)
+	if strings.Contains(contentOut, trigger) {
+		t.Fatalf("expected trigger stripped, got: %q", contentOut)
+	}
+	if !strings.Contains(contentOut, "<invoke") {
+		t.Fatalf("expected invoke to fall back as text, got: %q", contentOut)
+	}
+	if _, ok := msg["tool_calls"]; ok {
+		t.Fatalf("expected no tool_calls on parse failure")
 	}
 }
